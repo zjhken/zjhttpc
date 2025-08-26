@@ -2,6 +2,8 @@
 name = "zjhttpc"
 version = "0.1.0"
 edition = "2024"
+description = "HTTP client made by Jinhui ZHANG. Aims at easy to use, with special features I want"
+license = "GPLv3"
 
 [dependencies]
 anyhow_ext = "0.2.1"
