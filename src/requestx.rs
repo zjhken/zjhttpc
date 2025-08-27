@@ -45,13 +45,13 @@ impl Request {
         self
     }
 
-    pub fn add_header(&mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> &mut Self {
+    pub fn add_header(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
         // Add a header to the request
         unimplemented!();
         self
     }
 
-    pub fn set_header(&mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> &mut Self {
+    pub fn set_header(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
         // Set a header to the request
         self.headers
             .insert(key.as_ref().to_owned(), vec![value.as_ref().to_owned()]);
@@ -71,7 +71,7 @@ impl Request {
         unimplemented!()
     }
 
-    pub fn put_expect_continue(&mut self, expect: bool) -> &mut Self {
+    pub fn put_expect_continue(mut self, expect: bool) -> Self {
         self.expect_continue = true;
         self
     }
@@ -87,23 +87,23 @@ impl Request {
     }
 
     pub fn set_basic_auth(
-        &mut self,
+        mut self,
         username: impl AsRef<str>,
         password: impl AsRef<str>,
-    ) -> &mut Self {
+    ) -> Self {
         // Set the basic auth header
         self.basic_auth = Some((username.as_ref().to_owned(), password.as_ref().to_owned()));
         self
     }
 
-    pub fn set_body_string(&mut self, body: impl AsRef<str>) -> &mut Self {
+    pub fn set_body_string(mut self, body: impl AsRef<str>) -> Self {
         // Set the body of the request
         self.content_length = body.as_ref().len() as u64;
         self.body = Body::Str(body.as_ref().to_owned());
         self
     }
 
-    pub fn set_body_stream<R>(&mut self, body: R, length: u64) -> &mut Self 
+    pub fn set_body_stream<R>(mut self, body: R, length: u64) -> Self 
     where 
         R:async_std::io::Read + Unpin + Send + Sync + 'static,
     {
@@ -123,19 +123,19 @@ impl Request {
         Ok(self)
     }
 
-    pub fn body_slice(&mut self, body: impl AsRef<[u8]>) -> &mut Self {
+    pub fn body_slice(mut self, body: impl AsRef<[u8]>) -> Self {
         // Set the body of the request
         unimplemented!();
         self
     }
 
-    pub fn body_form(&mut self, form: HashMap<String, String>) -> &mut Self {
+    pub fn body_form(mut self, form: HashMap<String, String>) -> Self {
         // Set the body of the request
         unimplemented!();
         self
     }
 
-    pub fn body_multipart_form(&mut self, form: HashMap<String, String>) -> &mut Self {
+    pub fn body_multipart_form(mut self, form: HashMap<String, String>) -> Self {
         // Set the body of the request
         unimplemented!();
         self
