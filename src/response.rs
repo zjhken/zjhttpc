@@ -60,9 +60,6 @@ impl Response {
             body_stream: Some(stream),
             addr,
         };
-        if resp.content_length() == Some(0) {
-            resp.body_readed = true;
-        }
         return Ok(resp);
     }
     pub fn status_code(&self) -> u16 {
