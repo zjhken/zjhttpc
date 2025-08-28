@@ -233,14 +233,8 @@ where
     }
     // TODO: maybe need to handle segements like "#a=b"
     stream.write_all(b" ").await.dot()?;
-    // TODO: treat host as a normal header, generate it at the beginning
     stream.write_all(b"HTTP/1.1\r\n").await.dot()?;
-
-    // TODO: treat user agent as a normal header
-    stream
-        .write_all(b"User-Agent: zjhttpc/1.0\r\n")
-        .await
-        .dot()?;
+    // insert headers
     for (key, values) in &req.headers {
         stream.write_all(key.as_bytes()).await.dot()?;
         stream.write_all(b": ").await.dot()?;
