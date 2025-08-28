@@ -13,7 +13,7 @@ pub enum Body {
     None,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum TrustStorePem {
     Bytes(Vec<u8>),
     Path(std::path::PathBuf),

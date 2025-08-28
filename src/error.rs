@@ -1,5 +1,5 @@
-use thiserror::Error;
 use anyhow_ext::Result;
+use thiserror::Error;
 
 type ZjhttpCResult<T> = Result<T, ZjhttpcError>;
 
@@ -7,6 +7,8 @@ type ZjhttpCResult<T> = Result<T, ZjhttpcError>;
 pub enum ZjhttpcError {
     #[error("failed to parse the URL: {0}")]
     InvalidUrl(#[from] url::ParseError),
+    #[error("no host in url")]
+    NoHost,
     #[error("invalid/unsupport HTTP version in response:{0}")]
     InvalidHttpResponseVersion(String),
     #[error("invalid HTTP status code in response:{0}")]

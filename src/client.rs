@@ -32,7 +32,7 @@ use tracing::{error, info, trace, warn};
 static TCP_POOL: LazyLock<DashMap<SocketAddr, Vec<BoxedStream>>> = LazyLock::new(DashMap::new);
 static TLS_POOL: LazyLock<DashMap<SocketAddr, Vec<BoxedStream>>> = LazyLock::new(DashMap::new);
 
-#[derive(Builder)]
+#[derive(Builder, Default, Debug, Clone)]
 #[builder(setter(strip_option))]
 pub struct ZJHttpClient {
     // connection_pool: unimplemented!(),
@@ -67,9 +67,16 @@ impl ZJHttpClient {
         return Ok((stream, addr));
     }
 
-    pub async fn send_body_only(&self, req: &mut Request, mut stream_to_write: BoxedStream, addr: SocketAddr) -> Result<Response> {
+    pub async fn send_body_only(
+        &self,
+        req: &mut Request,
+        mut stream_to_write: BoxedStream,
+        addr: SocketAddr,
+    ) -> Result<Response> {
         send_body(req, &mut stream_to_write).await.dot()?;
-        let resp = read_headers_to_resp(req, stream_to_write, addr).await.dot()?;
+        let resp = read_headers_to_resp(req, stream_to_write, addr)
+            .await
+            .dot()?;
         return Ok(resp);
     }
 }
@@ -91,7 +98,7 @@ async fn pick_or_connect_stream(
             } else {
                 trace!(?addr, "no existing connection for this addr")
             }
-            let tcp_stream = TcpStream::connect(&addr).await.dot()?;
+            let tcp_stream = TcpStream::connect(&addr).await.dot().unwrap();
             return Ok(Box::new(tcp_stream));
         }
         "https" => {
@@ -220,16 +227,18 @@ where
     stream.write_all(b" ").await.dot()?;
     let path = req.url.path();
     stream.write_all(path.as_bytes()).await.dot()?;
+    if let Some(q) = req.url.query() {
+        stream.write_all(b"?").await.dot()?;
+        stream.write_all(q.as_bytes()).await.dot()?;
+    }
+    // TODO: maybe need to handle segements like "#a=b"
     stream.write_all(b" ").await.dot()?;
-    stream.write_all(b"HTTP/1.1\r\nHost: ").await.dot()?;
-    let host = req
-        .url
-        .host_str()
-        .ok_or_else(|| anyhow!("no host in url"))
-        .dot()?;
-    stream.write_all(host.as_bytes()).await.dot()?;
+    // TODO: treat host as a normal header, generate it at the beginning
+    stream.write_all(b"HTTP/1.1\r\n").await.dot()?;
+
+    // TODO: treat user agent as a normal header
     stream
-        .write_all(b"\r\nUser-Agent: zjhttpc/1.0\r\n")
+        .write_all(b"User-Agent: zjhttpc/1.0\r\n")
         .await
         .dot()?;
     for (key, values) in &req.headers {
@@ -331,7 +340,7 @@ async fn read_headers_to_resp(
         }
     };
     let input = std::str::from_utf8(data.as_ref()).dot()?;
-    let (_, (_, http_version, _, status_code, _, _, _)) = parse_resp_first_line(input)
+    let (_, (_, http_version, _, status_code, _)) = parse_resp_first_line(input)
         .map_err(|e| {
             anyhow!(
                 "{err}:parse resp first line failed. firstLine={line}",
@@ -345,7 +354,7 @@ async fn read_headers_to_resp(
     let headers = parse_headers(input)
         .dot()?
         .into_iter()
-        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .map(|(key, value)| (key.to_ascii_lowercase(), value.to_owned()))
         .collect::<Vec<_>>();
     return Response::new_from_parse_result(
         http_version,
@@ -384,15 +393,13 @@ fn parse_one_line_header(input: &str) -> IResult<&str, (&str, &str, &str, &str)>
     (is_not(": "), tag(": "), is_not("\r\n"), tag("\r\n")).parse(input)
 }
 
-fn parse_resp_first_line(input: &str) -> IResult<&str, (&str, &str, &str, &str, &str, &str, &str)> {
+fn parse_resp_first_line(input: &str) -> IResult<&str, (&str, &str, &str, &str, &str)> {
     (
         tag("HTTP/"),
         take_till(|x| x == ' '),
         tag(" "),
-        take_till(|x| x == ' '),
-        tag(" "),
-        is_not("\r\n"),
-        tag("\r\n"),
+        take_till(|x| x == ' ' || x == '\r'), // status message is not mandortory
+        take_till(|x| x == '\n')
     )
         .parse(input)
 }
@@ -463,9 +470,4 @@ pub fn return_stream_to_pool(resp: &mut Response) {
 pub enum HttpVersion {
     V1_1,
     V1_0,
-}
-#[cfg(test)]
-mod tests {
-
-
 }

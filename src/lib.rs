@@ -6,3 +6,6 @@ pub mod response;
 pub mod stream;
 pub mod client;
 pub mod misc;
+pub mod header;
+
+pub use url;

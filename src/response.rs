@@ -69,6 +69,10 @@ impl Response {
         self.status_code
     }
 
+    pub fn is_success(&self) -> bool {
+        (200u16..300u16).contains(&self.status_code)
+    }
+
     pub fn header_one(&self, key: impl AsRef<str>) -> Option<&str> {
         unimplemented!()
     }
