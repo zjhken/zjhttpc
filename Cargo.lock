@@ -736,6 +736,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "indexmap"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2481980430f9f78649238835720ddccc57e52df14ffce1c6f37391d61b563e9"
+dependencies = [
+ "equivalent",
+ "hashbrown 0.15.2",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1609,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "zjhttpc"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow_ext",
  "async-std",
@@ -1619,6 +1629,7 @@ dependencies = [
  "derive_builder",
  "futures",
  "hashbrown 0.15.2",
+ "indexmap",
  "nom",
  "rustls",
  "rustls-native-certs",

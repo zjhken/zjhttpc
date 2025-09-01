@@ -1,11 +1,14 @@
 use anyhow_ext::{Context, Result, anyhow};
 use async_std::io::ReadExt;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
+use indexmap::IndexSet;
 use std::{net::SocketAddr, vec};
 
-use tracing::info;
+use tracing::{info, trace};
 
-use crate::{client::return_stream_to_pool, error::ZjhttpcError, misc::HttpVersion, stream::BoxedStream};
+use crate::{
+    client::return_stream_to_pool, error::ZjhttpcError, misc::HttpVersion, stream::BoxedStream,
+};
 
 pub struct Response {
     pub addr: SocketAddr,
@@ -13,7 +16,7 @@ pub struct Response {
     pub body_readed: bool,
     pub http_version: HttpVersion,
     pub status_code: u16,
-    pub headers: HashMap<String, Vec<String>>,
+    pub headers: HashMap<String, IndexSet<String>>,
     /// if you use this stream, remember to set the body_readed to true if you read it
     /// otherwise this connection will be reused
     pub body_stream: Option<BoxedStream>,
@@ -42,16 +45,20 @@ impl Response {
         let status_code: u16 = status_code
             .parse()
             .map_err(|e| ZjhttpcError::InvalidHttpResponseStatusCode(status_code.to_string()))?;
-        let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+        let mut headers: HashMap<String, IndexSet<String>> = HashMap::new();
         for (key, value) in headers_vec {
             match headers.get_mut(&key) {
-                Some(vec) => vec.push(value),
-                None => {
-                    headers.insert(key, vec![value]);
+                Some(set) => {
+                    set.insert(value);
                 }
-            }
+                None => {
+                    let mut set = IndexSet::new();
+                    set.insert(value);
+                    headers.insert(key, set);
+                }
+            };
         }
-        let mut resp = Response {
+        let resp = Response {
             is_tls,
             body_readed: false,
             http_version,
@@ -70,8 +77,11 @@ impl Response {
         (200u16..300u16).contains(&self.status_code)
     }
 
-    pub fn header_one(&self, key: impl AsRef<str>) -> Option<&str> {
-        unimplemented!()
+    pub fn header_one(&self, header_name: impl AsRef<str>) -> Option<&str> {
+        self.headers
+            .get(&header_name.as_ref().to_ascii_lowercase())
+            .map(|x| x.first().map(|x| x.as_str()))
+            .flatten()
     }
 
     pub fn header_all(&self, key: impl AsRef<str>) -> Vec<&str> {
@@ -108,10 +118,35 @@ impl Response {
                     self.body_readed = true;
                     return String::from_utf8(v).dot();
                 }
-            },
+            }
             None => {
-                // TODO: handle chunk download
-                return Err(anyhow!("chunk download is not supported yet"))
+                // check whether it's chunk encoding
+                if let Some(set) = self.headers.get("transfer-encoding") {
+                    if set.contains("chunked") {
+                        // TODO support chunk
+                        return Err(anyhow!("chunk download is not supported yet"));
+                    }
+                }
+                // sometimes the server forget to return the content length
+                // so we have to read to the end
+                let mut v = vec![];
+                let stream = self
+                    .body_stream
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("impossible, body stream is none"))
+                    .dot()?;
+
+                let mut buf = [0u8; 1024 * 8];
+                loop {
+                    let n = stream.read(&mut buf[..]).await.dot()?;
+                    if n == 0 {
+                        trace!("stream ended");
+                        break;
+                    }
+                    v.extend_from_slice(&buf[..n]);
+                }
+                self.body_readed = true;
+                return String::from_utf8(v).dot();
             }
         }
     }
