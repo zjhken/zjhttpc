@@ -30,14 +30,14 @@ const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 impl Request {
     #[must_use]
-    pub fn new(url: impl AsRef<str>) -> Result<Self> {
+    pub fn new(method: &'static str, url: impl AsRef<str>) -> Result<Self> {
         let url: Url = url.as_ref().parse()?;
         let host = url.host_str().ok_or_else(|| ZjhttpcError::NoHost).dot()?;
         let mut headers = HashMap::new();
         headers.insert("host".to_owned(), vec![host.to_owned()]);
         headers.insert("user-agent".to_owned(), vec![format!("zjhttpc/{LIB_VERSION} (powered by Jinhui)")]);
         Ok(Request {
-            method: "GET",
+            method,
             url,
             headers,
             expect_continue: false,
