@@ -1619,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "zjhttpc"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "anyhow_ext",

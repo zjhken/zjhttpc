@@ -386,7 +386,7 @@ fn parse_headers(input: &str) -> Result<Vec<(&str, &str)>> {
 }
 
 fn parse_one_line_header(input: &str) -> IResult<&str, (&str, &str, &str, &str)> {
-    (is_not(": "), tag(": "), is_not("\r\n"), tag("\r\n")).parse(input)
+    (is_not(": "), tag(": "), take_till(|x| x == '\r' || x == '\n'), tag("\r\n")).parse(input)
 }
 
 fn parse_resp_first_line(input: &str) -> IResult<&str, (&str, &str, &str, &str, &str)> {
@@ -466,4 +466,143 @@ pub fn return_stream_to_pool(resp: &mut Response) {
 pub enum HttpVersion {
     V1_1,
     V1_0,
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_one_line_header_basic() {
+        let input = "Content-Type: application/json\r\n";
+        let result = parse_one_line_header(input);
+        assert!(result.is_ok());
+        
+        let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
+        assert_eq!(key, "Content-Type");
+        assert_eq!(colon_space, ": ");
+        assert_eq!(value, "application/json");
+        assert_eq!(crlf, "\r\n");
+        assert_eq!(remaining, "");
+    }
+
+    #[test]
+    fn test_parse_one_line_header_with_spaces_in_value() {
+        let input = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n";
+        let result = parse_one_line_header(input);
+        assert!(result.is_ok());
+        
+        let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
+        assert_eq!(key, "User-Agent");
+        assert_eq!(colon_space, ": ");
+        assert_eq!(value, "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+        assert_eq!(crlf, "\r\n");
+        assert_eq!(remaining, "");
+    }
+
+    #[test]
+    fn test_parse_one_line_header_empty_value_with_space() {
+        let input = "X-Custom-Header: \r\n";
+        let result = parse_one_line_header(input);
+        assert!(result.is_ok());
+        
+        let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
+        assert_eq!(key, "X-Custom-Header");
+        assert_eq!(colon_space, ": ");
+        assert_eq!(value, "");
+        assert_eq!(crlf, "\r\n");
+        assert_eq!(remaining, "");
+    }
+
+    #[test]
+    fn test_parse_one_line_header_empty_value_no_space() {
+        let input = "X-Custom-Header:\r\n";
+        let result = parse_one_line_header(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_one_line_header_with_remaining_input() {
+        let input = "Host: example.com\r\nContent-Length: 123\r\n";
+        let result = parse_one_line_header(input);
+        assert!(result.is_ok());
+        
+        let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
+        assert_eq!(key, "Host");
+        assert_eq!(colon_space, ": ");
+        assert_eq!(value, "example.com");
+        assert_eq!(crlf, "\r\n");
+        assert_eq!(remaining, "Content-Length: 123\r\n");
+    }
+
+    #[test]
+    fn test_parse_one_line_header_special_characters() {
+        let input = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\r\n";
+        let result = parse_one_line_header(input);
+        assert!(result.is_ok());
+        
+        let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
+        assert_eq!(key, "Authorization");
+        assert_eq!(colon_space, ": ");
+        assert_eq!(value, "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9");
+        assert_eq!(crlf, "\r\n");
+        assert_eq!(remaining, "");
+    }
+
+    #[test]
+    fn test_parse_one_line_header_numbers_and_symbols() {
+        let input = "Content-Length: 1024\r\n";
+        let result = parse_one_line_header(input);
+        assert!(result.is_ok());
+        
+        let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
+        assert_eq!(key, "Content-Length");
+        assert_eq!(colon_space, ": ");
+        assert_eq!(value, "1024");
+        assert_eq!(crlf, "\r\n");
+        assert_eq!(remaining, "");
+    }
+
+    #[test]
+    fn test_parse_one_line_header_missing_colon() {
+        let input = "InvalidHeader application/json\r\n";
+        let result = parse_one_line_header(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_one_line_header_missing_crlf() {
+        let input = "Content-Type: application/json";
+        let result = parse_one_line_header(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_one_line_header_only_crlf() {
+        let input = "\r\n";
+        let result = parse_one_line_header(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_one_line_header_empty_string() {
+        let input = "";
+        let result = parse_one_line_header(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_one_line_header_case_sensitive() {
+        let input = "content-type: text/html\r\n";
+        let result = parse_one_line_header(input);
+        assert!(result.is_ok());
+        
+        let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
+        assert_eq!(key, "content-type");
+        assert_eq!(colon_space, ": ");
+        assert_eq!(value, "text/html");
+        assert_eq!(crlf, "\r\n");
+        assert_eq!(remaining, "");
+    }
 }
