@@ -1,11 +1,12 @@
 [package]
 name = "zjhttpc"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 description = "HTTP client made by Jinhui ZHANG. Aims at easy to use, with special features I want"
 license = "GPL-3.0-only"
 
 [dependencies]
+anyhow = "1.0.99"
 anyhow_ext = "0.2.1"
 async-std = "1.13.0"
 async-tls = "0.13.0"

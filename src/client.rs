@@ -32,6 +32,7 @@ use tracing::{error, info, trace, warn};
 static TCP_POOL: LazyLock<DashMap<SocketAddr, Vec<BoxedStream>>> = LazyLock::new(DashMap::new);
 static TLS_POOL: LazyLock<DashMap<SocketAddr, Vec<BoxedStream>>> = LazyLock::new(DashMap::new);
 
+// TODO: default value with builder
 #[derive(Builder, Default, Debug, Clone)]
 #[builder(setter(strip_option))]
 pub struct ZJHttpClient {
