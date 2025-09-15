@@ -335,7 +335,6 @@ async fn read_headers_to_resp(
         }
     };
     let input = std::str::from_utf8(data.as_ref()).dot()?;
-    info!(input);
     let (_, (_, http_version, _, status_code, _)) = parse_resp_first_line(input)
         .map_err(|e| {
             anyhow!(
