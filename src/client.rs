@@ -4,6 +4,7 @@ use async_std::{
     io::{ReadExt, WriteExt},
     net::TcpStream,
 };
+use rand::seq::{IndexedRandom, SliceRandom};
 
 use async_tls::{TlsConnector, client::TlsStream};
 use dashmap::DashMap;
@@ -170,12 +171,16 @@ async fn is_stream_closed(stream: &mut BoxedStream) -> bool {
 }
 
 async fn resolve_1st_ip(req: &mut Request) -> Result<SocketAddr> {
-    let mut addrs = req.url.socket_addrs(|| None).dot()?;
+    let addrs = req.url.socket_addrs(|| None).dot()?;
+    if addrs.is_empty() {
+        return Err(anyhow!("no result in DNS resolve"));
+    }
+    let mut rng = rand::rng();
     let addr = addrs
-        .pop()
-        .ok_or_else(|| anyhow!("no result in DNS resolve"))
-        .dot()?;
-    return Ok(addr);
+        .choose(&mut rng)
+        .ok_or(anyhow!("no result in DNS resolve"))?
+        .to_owned();
+    Ok(addr)
 }
 
 pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::ClientConfig> {
@@ -385,7 +390,13 @@ fn parse_headers(input: &str) -> Result<Vec<(&str, &str)>> {
 }
 
 fn parse_one_line_header(input: &str) -> IResult<&str, (&str, &str, &str, &str)> {
-    (is_not(": "), tag(": "), take_till(|x| x == '\r' || x == '\n'), tag("\r\n")).parse(input)
+    (
+        is_not(": "),
+        tag(": "),
+        take_till(|x| x == '\r' || x == '\n'),
+        tag("\r\n"),
+    )
+        .parse(input)
 }
 
 fn parse_resp_first_line(input: &str) -> IResult<&str, (&str, &str, &str, &str, &str)> {
@@ -394,7 +405,7 @@ fn parse_resp_first_line(input: &str) -> IResult<&str, (&str, &str, &str, &str, 
         take_till(|x| x == ' '),
         tag(" "),
         take_till(|x| x == ' ' || x == '\r'), // status message is not mandortory
-        take_till(|x| x == '\n')
+        take_till(|x| x == '\n'),
     )
         .parse(input)
 }
@@ -467,7 +478,6 @@ pub enum HttpVersion {
     V1_0,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,7 +487,7 @@ mod tests {
         let input = "Content-Type: application/json\r\n";
         let result = parse_one_line_header(input);
         assert!(result.is_ok());
-        
+
         let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
         assert_eq!(key, "Content-Type");
         assert_eq!(colon_space, ": ");
@@ -491,7 +501,7 @@ mod tests {
         let input = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n";
         let result = parse_one_line_header(input);
         assert!(result.is_ok());
-        
+
         let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
         assert_eq!(key, "User-Agent");
         assert_eq!(colon_space, ": ");
@@ -505,7 +515,7 @@ mod tests {
         let input = "X-Custom-Header: \r\n";
         let result = parse_one_line_header(input);
         assert!(result.is_ok());
-        
+
         let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
         assert_eq!(key, "X-Custom-Header");
         assert_eq!(colon_space, ": ");
@@ -526,7 +536,7 @@ mod tests {
         let input = "Host: example.com\r\nContent-Length: 123\r\n";
         let result = parse_one_line_header(input);
         assert!(result.is_ok());
-        
+
         let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
         assert_eq!(key, "Host");
         assert_eq!(colon_space, ": ");
@@ -540,7 +550,7 @@ mod tests {
         let input = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\r\n";
         let result = parse_one_line_header(input);
         assert!(result.is_ok());
-        
+
         let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
         assert_eq!(key, "Authorization");
         assert_eq!(colon_space, ": ");
@@ -554,7 +564,7 @@ mod tests {
         let input = "Content-Length: 1024\r\n";
         let result = parse_one_line_header(input);
         assert!(result.is_ok());
-        
+
         let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
         assert_eq!(key, "Content-Length");
         assert_eq!(colon_space, ": ");
@@ -596,7 +606,7 @@ mod tests {
         let input = "content-type: text/html\r\n";
         let result = parse_one_line_header(input);
         assert!(result.is_ok());
-        
+
         let (remaining, (key, colon_space, value, crlf)) = result.unwrap();
         assert_eq!(key, "content-type");
         assert_eq!(colon_space, ": ");
