@@ -41,6 +41,7 @@ pub struct ZJHttpClient {
     // connection_pool: unimplemented!(),
     pub global_total_timeout: Duration,
     pub global_header_timeout: Duration,
+    pub global_connect_timeout: Duration,
     pub global_trust_store_pem: Option<TrustStorePem>,
     pub global_proxy: Option<HttpsProxyOption>,
 }
@@ -51,6 +52,7 @@ impl ZJHttpClient {
         ZJHttpClient {
             global_total_timeout: Duration::from_secs(300),
             global_header_timeout: Duration::from_secs(30),
+            global_connect_timeout: Duration::from_secs(3),
             global_trust_store_pem: None,
             global_proxy: None,
         }
@@ -65,6 +67,11 @@ impl ZJHttpClient {
         let proxy = HttpsProxyOption::new(proxy_url)?;
         self.global_proxy = Some(proxy);
         Ok(self)
+    }
+
+    pub fn set_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.global_connect_timeout = timeout;
+        self
     }
 
     pub async fn send(&self, req: &mut Request) -> Result<Response> {
@@ -105,6 +112,9 @@ async fn pick_or_connect_stream(
     // Determine which proxy to use (request-level takes precedence over client-level)
     let proxy = req.proxy.as_ref().or(client.global_proxy.as_ref());
 
+    // Determine connect timeout to use (request-level takes precedence over client-level)
+    let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
+
     if let Some(proxy_option) = proxy {
         // Use proxy connection
         let proxy_connector = if let Some(trust_store) = &req.trust_store_pem {
@@ -117,7 +127,7 @@ async fn pick_or_connect_stream(
         let target_port = req.url.port_or_known_default()
             .ok_or_else(|| anyhow!("URL must have a valid port"))?;
 
-        let stream = proxy_connector.connect(target_host, target_port).await?;
+        let stream = proxy_connector.connect(target_host, target_port, connect_timeout).await?;
         return Ok(stream);
     }
 
@@ -134,7 +144,13 @@ async fn pick_or_connect_stream(
             } else {
                 trace!(?addr, "no existing connection for this addr")
             }
-            let tcp_stream = TcpStream::connect(&addr).await.dot().unwrap();
+
+            // Create TCP stream with connect timeout
+            let tcp_stream = match timeout(connect_timeout, TcpStream::connect(&addr)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Err(anyhow!("TCP connection failed: {e}")),
+                Err(_err) => return Err(anyhow!("TCP connection timeout after {:?}", connect_timeout)),
+            };
             return Ok(Box::new(tcp_stream));
         }
         "https" => {
@@ -160,7 +176,14 @@ async fn pick_or_connect_stream(
                     "HTTPS request should specify the Domain instead of IP, or you can provide the sni doman name"
                 ));
             };
-            let tcp_stream = TcpStream::connect(addr).await.dot()?;
+
+            // Create TCP stream with connect timeout
+            let tcp_stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Err(anyhow!("TCP connection failed: {e}")),
+                Err(_err) => return Err(anyhow!("TCP connection timeout after {:?}", connect_timeout)),
+            };
+
             let tls_stream = tls_connector.connect(host, tcp_stream).await.dot()?;
             return Ok(Box::new(tls_stream));
         }
@@ -710,5 +733,17 @@ mod tests {
     fn test_client_invalid_proxy_url() {
         let result = ZJHttpClient::new().set_proxy_from_url("invalid-url");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_client_connect_timeout_default() {
+        let client = ZJHttpClient::new();
+        assert_eq!(client.global_connect_timeout, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_client_connect_timeout_custom() {
+        let client = ZJHttpClient::new().set_connect_timeout(Duration::from_secs(10));
+        assert_eq!(client.global_connect_timeout, Duration::from_secs(10));
     }
 }

@@ -150,14 +150,14 @@ impl ProxyConnector {
         })
     }
 
-    pub async fn connect(&self, target_host: &str, target_port: u16) -> Result<BoxedStream> {
+    pub async fn connect(&self, target_host: &str, target_port: u16, connect_timeout: Duration) -> Result<BoxedStream> {
         let proxy_addr = self.proxy.addr;
 
         if self.proxy.url.scheme() == "https" {
-            self.connect_https_proxy(proxy_addr, target_host, target_port)
+            self.connect_https_proxy(proxy_addr, target_host, target_port, connect_timeout)
                 .await
         } else {
-            self.connect_http_proxy(proxy_addr, target_host, target_port)
+            self.connect_http_proxy(proxy_addr, target_host, target_port, connect_timeout)
                 .await
         }
     }
@@ -167,6 +167,7 @@ impl ProxyConnector {
         proxy_addr: SocketAddr,
         target_host: &str,
         target_port: u16,
+        connect_timeout: Duration,
     ) -> Result<BoxedStream> {
         if let Some(Some(mut stream_from_pool)) =
             PROXY_TCP_POOL.get_mut(&proxy_addr).map(|mut x| x.pop())
@@ -179,9 +180,12 @@ impl ProxyConnector {
             }
         }
 
-        let mut tcp_stream = TcpStream::connect(&proxy_addr)
-            .await
-            .context("failed to connect to HTTP proxy")?;
+        // Create TCP stream with connect timeout
+        let mut tcp_stream = match async_std::future::timeout(connect_timeout, TcpStream::connect(&proxy_addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(anyhow!("HTTP proxy connection failed: {e}")),
+            Err(_) => return Err(anyhow!("HTTP proxy connection timeout after {:?}", connect_timeout)),
+        };
 
         let connect_request = format!(
             "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Connection: Keep-Alive\r\n",
@@ -237,6 +241,7 @@ impl ProxyConnector {
         proxy_addr: SocketAddr,
         target_host: &str,
         target_port: u16,
+        connect_timeout: Duration,
     ) -> Result<BoxedStream> {
         if let Some(Some(mut stream_from_pool)) =
             PROXY_TLS_POOL.get_mut(&proxy_addr).map(|mut x| x.pop())
@@ -250,9 +255,13 @@ impl ProxyConnector {
         }
 
         let tls_connector: TlsConnector = self.tls_config.clone().into();
-        let tcp_stream = TcpStream::connect(&proxy_addr)
-            .await
-            .context("failed to connect to HTTPS proxy")?;
+
+        // Create TCP stream with connect timeout
+        let tcp_stream = match async_std::future::timeout(connect_timeout, TcpStream::connect(&proxy_addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => return Err(anyhow!("HTTPS proxy connection failed: {e}")),
+            Err(_) => return Err(anyhow!("HTTPS proxy connection timeout after {:?}", connect_timeout)),
+        };
 
         let proxy_host = self
             .proxy
@@ -546,5 +555,24 @@ mod tests {
         assert_eq!(proxy.url.scheme(), "http");
         assert_eq!(proxy.url.host_str().unwrap(), "proxy.example.com");
         assert_eq!(proxy.url.port(), Some(3128));
+    }
+
+    #[test]
+    fn test_proxy_connect_timeout() {
+        use std::time::Duration;
+
+        async_std::task::block_on(async {
+            let proxy = HttpsProxyOption::new("http://192.0.2.1:8080").unwrap(); // RFC5737 test address
+            let connector = ProxyConnector::new(proxy).unwrap();
+
+            let start = std::time::Instant::now();
+            let result = connector.connect("example.com", 80, Duration::from_secs(1)).await;
+            let elapsed = start.elapsed();
+
+            assert!(result.is_err());
+            assert!(elapsed < Duration::from_secs(2)); // Should timeout within ~1 second
+            let error_msg = format!("{:?}", result.err().unwrap());
+            assert!(error_msg.contains("timeout"));
+        })
     }
 }

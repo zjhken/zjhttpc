@@ -23,6 +23,7 @@ pub struct Request {
     pub basic_auth: Option<(String, String)>,
     pub content_length: u64,
     pub header_timeout: Option<Duration>,
+    pub connect_timeout: Option<Duration>,
     pub body: Body,
     pub trust_store_pem: Option<TrustStorePem>,
     pub proxy: Option<HttpsProxyOption>,
@@ -48,6 +49,7 @@ impl Request {
             body: Body::None,
             content_length: 0,
             header_timeout: None,
+            connect_timeout: None,
             trust_store_pem: None,
             proxy: None,
         })
@@ -187,6 +189,11 @@ impl Request {
         self.proxy = Some(proxy);
         Ok(self)
     }
+
+    pub fn set_connect_timeout(mut self, dur: Duration) -> Self {
+        self.connect_timeout = Some(dur);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -260,5 +267,18 @@ mod tests {
         let result = Request::new("GET", "http://example.com").unwrap()
             .set_proxy_from_url("invalid-url");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_request_connect_timeout() {
+        let request = Request::new("GET", "http://example.com").unwrap()
+            .set_connect_timeout(Duration::from_secs(5));
+        assert_eq!(request.connect_timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_request_connect_timeout_default() {
+        let request = Request::new("GET", "http://example.com").unwrap();
+        assert_eq!(request.connect_timeout, None);
     }
 }
