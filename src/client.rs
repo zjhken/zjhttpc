@@ -4,7 +4,7 @@ use async_std::{
     io::{ReadExt, WriteExt},
     net::TcpStream,
 };
-use rand::seq::{IndexedRandom, SliceRandom};
+use rand::seq::IndexedRandom;
 
 use async_tls::{TlsConnector, client::TlsStream};
 use dashmap::DashMap;
@@ -23,6 +23,7 @@ use std::{
 
 use crate::{
     misc::{Body, TrustStorePem},
+    proxy::{HttpsProxyOption, ProxyConnector, PROXY_TCP_POOL, PROXY_TLS_POOL},
     requestx::Request,
     response::Response,
     stream::BoxedStream,
@@ -41,6 +42,7 @@ pub struct ZJHttpClient {
     pub global_total_timeout: Duration,
     pub global_header_timeout: Duration,
     pub global_trust_store_pem: Option<TrustStorePem>,
+    pub global_proxy: Option<HttpsProxyOption>,
 }
 
 impl ZJHttpClient {
@@ -50,7 +52,19 @@ impl ZJHttpClient {
             global_total_timeout: Duration::from_secs(300),
             global_header_timeout: Duration::from_secs(30),
             global_trust_store_pem: None,
+            global_proxy: None,
         }
+    }
+
+    pub fn set_proxy(mut self, proxy: HttpsProxyOption) -> Self {
+        self.global_proxy = Some(proxy);
+        self
+    }
+
+    pub fn set_proxy_from_url(mut self, proxy_url: impl AsRef<str>) -> Result<Self> {
+        let proxy = HttpsProxyOption::new(proxy_url)?;
+        self.global_proxy = Some(proxy);
+        Ok(self)
     }
 
     pub async fn send(&self, req: &mut Request) -> Result<Response> {
@@ -58,7 +72,7 @@ impl ZJHttpClient {
         let mut stream: BoxedStream = pick_or_connect_stream(self, &req, &addr).await.dot()?;
         send_header(req, &mut stream).await.dot()?;
         send_body(req, &mut stream).await.dot()?;
-        let resp = read_headers_to_resp(req, stream, addr).await.dot()?;
+        let resp = read_headers_to_resp(self, req, stream, addr).await.dot()?;
         return Ok(resp);
     }
 
@@ -76,7 +90,7 @@ impl ZJHttpClient {
         addr: SocketAddr,
     ) -> Result<Response> {
         send_body(req, &mut stream_to_write).await.dot()?;
-        let resp = read_headers_to_resp(req, stream_to_write, addr)
+        let resp = read_headers_to_resp(self, req, stream_to_write, addr)
             .await
             .dot()?;
         return Ok(resp);
@@ -88,6 +102,26 @@ async fn pick_or_connect_stream(
     req: &Request,
     addr: &SocketAddr,
 ) -> Result<BoxedStream> {
+    // Determine which proxy to use (request-level takes precedence over client-level)
+    let proxy = req.proxy.as_ref().or(client.global_proxy.as_ref());
+
+    if let Some(proxy_option) = proxy {
+        // Use proxy connection
+        let proxy_connector = if let Some(trust_store) = &req.trust_store_pem {
+            ProxyConnector::new_with_trust_store(proxy_option.clone(), &Some(trust_store.clone()))?
+        } else {
+            ProxyConnector::new_with_trust_store(proxy_option.clone(), &client.global_trust_store_pem)?
+        };
+
+        let target_host = req.url.host_str().ok_or(anyhow!("no host in URL"))?;
+        let target_port = req.url.port_or_known_default()
+            .ok_or_else(|| anyhow!("URL must have a valid port"))?;
+
+        let stream = proxy_connector.connect(target_host, target_port).await?;
+        return Ok(stream);
+    }
+
+    // Direct connection (existing logic)
     match req.url.scheme() {
         "http" => {
             if let Some(Some(mut stream_from_pool)) = TCP_POOL.get_mut(addr).map(|mut x| x.pop()) {
@@ -326,10 +360,13 @@ where
 }
 
 async fn read_headers_to_resp(
+    client: &ZJHttpClient,
     req: &mut Request,
     mut stream: BoxedStream,
     addr: SocketAddr,
 ) -> Result<Response> {
+    // Determine which proxy was used (request-level takes precedence over client-level)
+    let proxy_used = req.proxy.as_ref().or(client.global_proxy.as_ref()).cloned();
     // let mut buf = [0u8; 1024 * 8];
     let data = {
         let fut = read_until(&mut stream, b"\r\n");
@@ -363,6 +400,7 @@ async fn read_headers_to_resp(
         stream,
         req.url.scheme() == "https",
         addr,
+        proxy_used,
     )
     .map_err(|e| anyhow!("{e}"));
 }
@@ -441,34 +479,67 @@ pub fn return_stream_to_pool(resp: &mut Response) {
         return;
     }
     if let Some(stream) = resp.body_stream.take() {
-        // TODO: cast the stream to known which type, so no need the is_tls, just put it back to pool
-        if resp.is_tls {
-            if let Some(mut pool) = TLS_POOL.get_mut(&resp.addr) {
+        // If proxy was used, return to proxy pool
+        if let Some(proxy) = &resp.proxy_used {
+            let proxy_addr = proxy.addr;
+            if proxy.url.scheme() == "https" {
+                if let Some(mut pool) = PROXY_TLS_POOL.get_mut(&proxy_addr) {
+                    let len = pool.len();
+                    if len <= 30 {
+                        pool.push(stream);
+                        let len = pool.len();
+                        trace!(len, "proxy TLS stream returned to pool");
+                    } else {
+                        trace!(len, "proxy TLS pool is full");
+                    }
+                } else {
+                    PROXY_TLS_POOL.insert(proxy_addr, vec![stream]);
+                    trace!("add new vec to proxy TLS pool");
+                }
+            } else {
+                if let Some(mut pool) = PROXY_TCP_POOL.get_mut(&proxy_addr) {
+                    let len = pool.len();
+                    if len <= 30 {
+                        pool.push(stream);
+                        let len = pool.len();
+                        trace!(len, "proxy TCP stream returned to pool");
+                    } else {
+                        trace!(len, "proxy TCP pool is full");
+                    }
+                } else {
+                    PROXY_TCP_POOL.insert(proxy_addr, vec![stream]);
+                    trace!("add new vec to proxy TCP pool");
+                }
+            }
+        } else {
+            // Direct connection - use existing logic
+            if resp.is_tls {
+                if let Some(mut pool) = TLS_POOL.get_mut(&resp.addr) {
+                    let len = pool.len();
+                    if len <= 30 {
+                        pool.push(stream);
+                        let len = pool.len();
+                        trace!(len, "tls stream returned");
+                    } else {
+                        trace!(len, "tls pool is full");
+                    }
+                } else {
+                    TLS_POOL.insert(resp.addr, vec![stream]);
+                    trace!("add new vec to tls pool");
+                }
+            } else if let Some(mut pool) = TCP_POOL.get_mut(&resp.addr) {
                 let len = pool.len();
-                // TODO: allow user to set the pool size
                 if len <= 30 {
                     pool.push(stream);
                     let len = pool.len();
-                    trace!(len, "tls stream returned");
+                    trace!(len, "tcp stream returned");
                 } else {
-                    trace!(len, "tls pool is full");
+                    trace!(len, "tcp pool is full");
                 }
             } else {
-                TLS_POOL.insert(resp.addr, vec![stream]);
-                trace!("add new vec to tls pool");
+                TCP_POOL.insert(resp.addr, vec![stream]);
+                trace!("tcp add new vec to pool");
             }
-        } else if let Some(mut pool) = TCP_POOL.get_mut(&resp.addr) {
-            let len = pool.len();
-            if len <= 30 {
-                pool.push(stream);
-                let len = pool.len();
-                trace!(len, "tcp stream returned");
-            } else {
-                trace!(len, "tcp pool is full");
-            }
-        } else {
-            TCP_POOL.insert(resp.addr, vec![stream]);
-            trace!("tcp add new vec to pool");
         }
     }
 }
@@ -613,5 +684,31 @@ mod tests {
         assert_eq!(value, "text/html");
         assert_eq!(crlf, "\r\n");
         assert_eq!(remaining, "");
+    }
+
+    #[test]
+    fn test_client_proxy_configuration() {
+        let mut client = ZJHttpClient::new();
+        assert!(client.global_proxy.is_none());
+
+        let proxy = HttpsProxyOption::new("http://proxy.example.com:8080").unwrap();
+        client = client.set_proxy(proxy.clone());
+        assert!(client.global_proxy.is_some());
+        assert_eq!(client.global_proxy.unwrap().url.host_str().unwrap(), "proxy.example.com");
+    }
+
+    #[test]
+    fn test_client_proxy_from_url() {
+        let result = ZJHttpClient::new().set_proxy_from_url("http://proxy.example.com:8080");
+        assert!(result.is_ok());
+        let client = result.unwrap();
+        assert!(client.global_proxy.is_some());
+        assert_eq!(client.global_proxy.unwrap().url.host_str().unwrap(), "proxy.example.com");
+    }
+
+    #[test]
+    fn test_client_invalid_proxy_url() {
+        let result = ZJHttpClient::new().set_proxy_from_url("invalid-url");
+        assert!(result.is_err());
     }
 }

@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::{
     error::ZjhttpcError,
     misc::{Body, TrustStorePem},
+    proxy::HttpsProxyOption,
 };
 
 pub struct Request {
@@ -24,6 +25,7 @@ pub struct Request {
     pub header_timeout: Option<Duration>,
     pub body: Body,
     pub trust_store_pem: Option<TrustStorePem>,
+    pub proxy: Option<HttpsProxyOption>,
 }
 
 const LIB_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -47,6 +49,7 @@ impl Request {
             content_length: 0,
             header_timeout: None,
             trust_store_pem: None,
+            proxy: None,
         })
     }
 
@@ -173,10 +176,22 @@ impl Request {
         self.header_timeout = Some(dur);
         self
     }
+
+    pub fn set_proxy(mut self, proxy: HttpsProxyOption) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    pub fn set_proxy_from_url(mut self, proxy_url: impl AsRef<str>) -> Result<Self> {
+        let proxy = HttpsProxyOption::new(proxy_url)?;
+        self.proxy = Some(proxy);
+        Ok(self)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use url::Url;
 
     #[test]
@@ -217,5 +232,33 @@ mod tests {
         url.query_pairs_mut().append_pair("c", "d");
         // url.set_query(Some("c=d"));
         println!("{x}", x = url.to_string())
+    }
+
+    #[test]
+    fn test_request_proxy_configuration() {
+        let mut request = Request::new("GET", "http://example.com").unwrap();
+        assert!(request.proxy.is_none());
+
+        let proxy = crate::proxy::HttpsProxyOption::new("http://proxy.example.com:8080").unwrap();
+        request = request.set_proxy(proxy.clone());
+        assert!(request.proxy.is_some());
+        assert_eq!(request.proxy.unwrap().url.host_str().unwrap(), "proxy.example.com");
+    }
+
+    #[test]
+    fn test_request_proxy_from_url() {
+        let result = Request::new("GET", "http://example.com").unwrap()
+            .set_proxy_from_url("http://proxy.example.com:8080");
+        assert!(result.is_ok());
+        let request = result.unwrap();
+        assert!(request.proxy.is_some());
+        assert_eq!(request.proxy.unwrap().url.host_str().unwrap(), "proxy.example.com");
+    }
+
+    #[test]
+    fn test_request_invalid_proxy_url() {
+        let result = Request::new("GET", "http://example.com").unwrap()
+            .set_proxy_from_url("invalid-url");
+        assert!(result.is_err());
     }
 }

@@ -1,13 +1,13 @@
 use anyhow_ext::{Context, Result, anyhow};
 use async_std::io::ReadExt;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use indexmap::IndexSet;
 use std::{net::SocketAddr, vec};
 
 use tracing::{info, trace};
 
 use crate::{
-    client::return_stream_to_pool, error::ZjhttpcError, misc::HttpVersion, stream::BoxedStream,
+    client::return_stream_to_pool, error::ZjhttpcError, misc::HttpVersion, proxy::HttpsProxyOption, stream::BoxedStream,
 };
 
 pub struct Response {
@@ -20,6 +20,7 @@ pub struct Response {
     /// if you use this stream, remember to set the body_readed to true if you read it
     /// otherwise this connection will be reused
     pub body_stream: Option<BoxedStream>,
+    pub proxy_used: Option<HttpsProxyOption>,
 }
 
 impl Drop for Response {
@@ -36,6 +37,7 @@ impl Response {
         stream: BoxedStream,
         is_tls: bool,
         addr: SocketAddr,
+        proxy_used: Option<HttpsProxyOption>,
     ) -> Result<Self, ZjhttpcError> {
         let http_version = match http_version {
             "1.1" => HttpVersion::V1_1,
@@ -66,6 +68,7 @@ impl Response {
             headers,
             body_stream: Some(stream),
             addr,
+            proxy_used,
         };
         return Ok(resp);
     }
