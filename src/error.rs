@@ -1,7 +1,7 @@
-use anyhow_ext::Result;
+// use anyhow_ext::Result;
 use thiserror::Error;
 
-type ZjhttpCResult<T> = Result<T, ZjhttpcError>;
+// type ZjhttpCResult<T> = Result<T, ZjhttpcError>;
 
 #[derive(Debug, Error)]
 pub enum ZjhttpcError {

@@ -100,15 +100,15 @@ impl Request {
         Ok(self)
     }
 
-    pub fn header_one(&self, key: impl AsRef<str>) -> Option<&String> {
+    pub fn header_one(&self, _key: impl AsRef<str>) -> Option<&String> {
         unimplemented!()
     }
 
-    pub fn header_all(&self, key: impl AsRef<str>) -> Vec<&String> {
+    pub fn header_all(&self, _key: impl AsRef<str>) -> Vec<&String> {
         unimplemented!()
     }
 
-    pub fn put_expect_continue(mut self, expect: bool) -> Self {
+    pub fn put_expect_continue(mut self, _expect: bool) -> Self {
         self.expect_continue = true;
         self
     }
@@ -156,22 +156,19 @@ impl Request {
         Ok(self)
     }
 
-    pub fn body_slice(self, body: impl AsRef<[u8]>) -> Self {
+    pub fn body_slice(self, _body: impl AsRef<[u8]>) -> Self {
         // Set the body of the request
         unimplemented!();
-        self
     }
 
-    pub fn body_form(self, form: HashMap<String, String>) -> Self {
+    pub fn body_form(self, _form: HashMap<String, String>) -> Self {
         // Set the body of the request
         unimplemented!();
-        self
     }
 
-    pub fn body_multipart_form(self, form: HashMap<String, String>) -> Self {
+    pub fn body_multipart_form(self, _form: HashMap<String, String>) -> Self {
         // Set the body of the request
         unimplemented!();
-        self
     }
 
     pub fn set_header_timeout(mut self, dur: Duration) -> Self {

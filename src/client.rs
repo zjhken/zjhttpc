@@ -215,7 +215,7 @@ async fn is_stream_closed(stream: &mut BoxedStream) -> bool {
                     return false;
                 }
                 Err(err) => {
-                    info!("get unexpected error, stream closed");
+                    info!(?err, "get unexpected error, stream closed");
                     return true;
                 }
             },
@@ -494,8 +494,32 @@ where
     Ok(buf)
 }
 
+pub async fn read_until_v<S>(stream: &mut S, delimiter: &[u8], buf: &mut Vec<u8>) -> Result<usize>
+where
+    S: async_std::io::Read + Unpin + Send + Sync + 'static,
+{
+    buf.clear();
+    let mut one_byte = [0u8; 1];
+    let mut n = 0usize;
+    if delimiter.is_empty() {
+        return Err(anyhow!("delemeter should not be empty"));
+    }
+    loop {
+        let read_n = stream.read(&mut one_byte).await.dot()?;
+        if read_n == 0 {
+            break;
+        }
+        buf.push(one_byte[0]);
+        n += 1;
+        if buf.ends_with(delimiter) {
+            break;
+        }
+    }
+    Ok(n)
+}
+
 pub fn return_stream_to_pool(resp: &mut Response) {
-    if !resp.body_readed {
+    if !resp.body_successfully_readed {
         // TODO: for now just close the connection
         // in the future we can try to drain it with timeout
         // but during the data reading, we have to consider the content-length and transfer-encoding

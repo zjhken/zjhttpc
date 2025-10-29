@@ -7,13 +7,17 @@ use std::{net::SocketAddr, vec};
 use tracing::{info, trace};
 
 use crate::{
-    client::return_stream_to_pool, error::ZjhttpcError, misc::HttpVersion, proxy::HttpsProxyOption, stream::BoxedStream,
+    client::{read_until_v, return_stream_to_pool},
+    error::ZjhttpcError,
+    misc::HttpVersion,
+    proxy::HttpsProxyOption,
+    stream::BoxedStream,
 };
 
 pub struct Response {
     pub addr: SocketAddr,
     pub is_tls: bool,
-    pub body_readed: bool,
+    pub body_successfully_readed: bool,
     pub http_version: HttpVersion,
     pub status_code: u16,
     pub headers: HashMap<String, IndexSet<String>>,
@@ -46,7 +50,7 @@ impl Response {
         };
         let status_code: u16 = status_code
             .parse()
-            .map_err(|e| ZjhttpcError::InvalidHttpResponseStatusCode(status_code.to_string()))?;
+            .map_err(|_e| ZjhttpcError::InvalidHttpResponseStatusCode(status_code.to_string()))?;
         let mut headers: HashMap<String, IndexSet<String>> = HashMap::new();
         for (key, value) in headers_vec {
             match headers.get_mut(&key) {
@@ -62,7 +66,7 @@ impl Response {
         }
         let resp = Response {
             is_tls,
-            body_readed: false,
+            body_successfully_readed: false,
             http_version,
             status_code,
             headers,
@@ -87,12 +91,12 @@ impl Response {
             .flatten()
     }
 
-    pub fn header_all(&self, key: impl AsRef<str>) -> Vec<&str> {
+    pub fn header_all(&self, _key: impl AsRef<str>) -> Vec<&str> {
         unimplemented!()
     }
 
     pub async fn body_string(&mut self) -> Result<String> {
-        if self.body_readed {
+        if self.body_successfully_readed {
             return Err(anyhow!("response body has been read"));
         }
         match self.content_length() {
@@ -118,16 +122,18 @@ impl Response {
                         v.extend_from_slice(&buf[..n]);
                         remaining -= n;
                     }
-                    self.body_readed = true;
+                    self.body_successfully_readed = true;
                     return String::from_utf8(v).dot();
                 }
             }
             None => {
+                // TODO: handler compression case
                 // check whether it's chunk encoding
                 if let Some(set) = self.headers.get("transfer-encoding") {
                     if set.contains("chunked") {
-                        // TODO support chunk
-                        return Err(anyhow!("chunk download is not supported yet"));
+                        let bytes = self.read_chunked_body().await.dot()?;
+                        let s = String::from_utf8(bytes).dot()?;
+                        return Ok(s)
                     }
                 }
                 // sometimes the server forget to return the content length
@@ -148,7 +154,7 @@ impl Response {
                     }
                     v.extend_from_slice(&buf[..n]);
                 }
-                self.body_readed = true;
+                self.body_successfully_readed = true;
                 return String::from_utf8(v).dot();
             }
         }
@@ -179,5 +185,50 @@ impl Response {
             .get("content-length")
             .and_then(|vec| vec.first())
             .and_then(|s| s.parse::<u64>().ok())
+    }
+
+    async fn read_chunked_body(&mut self) -> Result<Vec<u8>> {
+        if let Some(stream) = self.body_stream.as_mut() {
+            let stream = stream as &mut BoxedStream;
+            // read the size line
+            let mut line_buf: Vec<u8> = vec![];
+            let mut result = Vec::new();
+            loop {
+                let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
+                // Parse chunk size (remove \r if present)
+                let chunk_size_str = String::from_utf8_lossy(&line_buf[..n]);
+                let chunk_size_str = chunk_size_str.trim_end_matches("\r\n");
+                let chunk_size = usize::from_str_radix(chunk_size_str, 16)
+                    .map_err(|e| anyhow!("invalid chunk size '{}': {}", chunk_size_str, e))?;
+                // Last chunk (size 0) indicates end
+                if chunk_size == 0 {
+                    let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
+                    if n != 2 {
+                        let x = String::from_utf8_lossy(&line_buf[..n]);
+                        return Err(anyhow!("not possible, it's not \\r\\n after zero in chunk. x={x}, n={n}"));
+                    }
+                    self.body_successfully_readed = true;
+                    break;
+                } else {
+                    // Read chunk data
+                    let mut buf = [0u8; 1024];
+                    let mut remaining = chunk_size;
+                    while remaining > 0 {
+                        let to_read = std::cmp::min(buf.len(), remaining);
+                        let n = stream.read(&mut buf[..to_read]).await.dot()?;
+                        if n == 0 {
+                            return Err(anyhow!(
+                                "unexpected end of stream while reading chunk data"
+                            ));
+                        }
+                        result.extend_from_slice(&buf[..n]);
+                        remaining -= n;
+                    }
+                }
+            }
+            return Ok(result);
+        } else {
+            return Err(anyhow!("impossible, body stream is none"));
+        }
     }
 }
