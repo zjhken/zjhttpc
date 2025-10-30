@@ -123,7 +123,7 @@ impl Response {
                         remaining -= n;
                     }
                     self.body_successfully_readed = true;
-                    return String::from_utf8(v).dot();
+                    return Ok(String::from_utf8_lossy(&v).to_string());
                 }
             }
             None => {
@@ -132,8 +132,7 @@ impl Response {
                 if let Some(set) = self.headers.get("transfer-encoding") {
                     if set.contains("chunked") {
                         let bytes = self.read_chunked_body().await.dot()?;
-                        let s = String::from_utf8(bytes).dot()?;
-                        return Ok(s)
+                        return Ok(String::from_utf8_lossy(&bytes).to_string())
                     }
                 }
                 // sometimes the server forget to return the content length
@@ -160,9 +159,9 @@ impl Response {
         }
     }
 
-    // pub fn body_stream(&self) -> impl async_std::io::Read {
-    //     unimplemented!()
-    // }
+    pub fn body_stream(&mut self) -> Option<&mut BoxedStream> {
+        unimplemented!()
+    }
 
     pub fn body_slice(&self) -> &[u8] {
         unimplemented!()
@@ -194,12 +193,17 @@ impl Response {
             let mut line_buf: Vec<u8> = vec![];
             let mut result = Vec::new();
             loop {
+                
                 let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
-                // Parse chunk size (remove \r if present)
-                let chunk_size_str = String::from_utf8_lossy(&line_buf[..n]);
-                let chunk_size_str = chunk_size_str.trim_end_matches("\r\n");
-                let chunk_size = usize::from_str_radix(chunk_size_str, 16)
-                    .map_err(|e| anyhow!("invalid chunk size '{}': {}", chunk_size_str, e))?;
+
+                let mut chunk_size_str = String::from_utf8_lossy(&line_buf[..n]);
+                // sometimes there wil be \r\n in the beginning instead of the number
+                if chunk_size_str.trim().is_empty() {
+                    let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
+                    chunk_size_str = String::from_utf8_lossy(&line_buf[..n]);
+                }
+                let chunk_size = usize::from_str_radix(chunk_size_str.trim(), 16)
+                    .map_err(|e| anyhow!("invalid chunk size '{:?}': {}", chunk_size_str.as_bytes(), e))?;
                 // Last chunk (size 0) indicates end
                 if chunk_size == 0 {
                     let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
@@ -231,4 +235,31 @@ impl Response {
             return Err(anyhow!("impossible, body stream is none"));
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_std::task;
+
+    use crate::{client::ZJHttpClient, requestx::Request};
+
+    use super::*;
+
+    #[test]
+    fn new_from_parse_result_and_basic_getters() {
+        let x = "\r\nf5e\r\n".trim();
+        println!("{x}");
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_chunked() {
+        task::block_on(async {
+            let mut req = Request::new("GET", "http://127.0.0.1:8888/test/chunk").unwrap();
+            let mut resp = ZJHttpClient::new().send(&mut req).await.unwrap();
+            let s = resp.body_string().await.unwrap();
+            info!(s);
+        });
+    }
+
 }

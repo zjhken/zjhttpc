@@ -29,3 +29,6 @@ thiserror = "2.0.12"
 thiserror-context = "0.1.2"
 tracing = "0.1.41"
 url = "2.5.4"
+
+[dev-dependencies]
+tracing-test = "0.2.5"
