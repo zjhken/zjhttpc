@@ -576,8 +576,12 @@ impl Response {
             .flatten()
     }
 
-    pub fn header_all(&self, _key: impl AsRef<str>) -> Vec<&str> {
-        unimplemented!()
+    pub fn header_all(&self, key: impl AsRef<str>) -> Vec<&str> {
+        let key = key.as_ref().to_ascii_lowercase();
+        self.headers
+            .get(&key)
+            .map(|set| set.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default()
     }
 
     pub async fn body_string(&mut self) -> Result<String> {
@@ -686,20 +690,31 @@ impl Response {
         }
     }
 
-    pub fn body_slice(&self) -> &[u8] {
-        unimplemented!()
+    /// Read the entire body and return it as bytes
+    /// 
+    /// This method consumes the response body and reads all data into memory.
+    /// For large bodies, consider using body_managed_stream() for streaming access.
+    pub async fn body_bytes(&mut self) -> Result<Vec<u8>> {
+        if self.body_successfully_readed {
+            return Err(anyhow!("response body has been read"));
+        }
+
+        if let Some(mut stream) = self.body_managed_stream() {
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192]; // 8KB buffer
+            while let n = stream.read(&mut buf).await.dot()? && n > 0 {
+                bytes.extend_from_slice(&buf[..n]);
+            }
+            Ok(bytes)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
-    pub fn body_json(&self) -> serde_json::Value {
-        unimplemented!()
-    }
-
-    pub fn body_form(&self) -> HashMap<String, String> {
-        unimplemented!()
-    }
-
-    pub fn body_multipart_form(&self) -> HashMap<String, String> {
-        unimplemented!()
+    // reading the entire body and return a JSON object
+    pub async fn body_json(&mut self) -> Result<serde_json::Value> {
+        let bytes = self.body_bytes().await?;
+        serde_json::from_slice(&bytes).map_err(|e| anyhow!("JSON parsing failed: {}", e))
     }
 
     pub fn content_length(&self) -> Option<u64> {
@@ -1185,7 +1200,6 @@ mod tests {
     #[test]
     fn test_response_body_successfully_readed_flag() {
         use hashbrown::HashMap;
-        use indexmap::IndexSet;
         use std::net::SocketAddr;
 
         // Create a mock response
@@ -1283,5 +1297,291 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
         assert!(fixed_stream.is_fully_consumed());
+    }
+
+    #[test]
+    fn test_body_bytes_method() {
+        use async_std::io::ReadExt;
+
+        // Create a test stream
+        struct TestStream {
+            data: Vec<u8>,
+            position: usize,
+        }
+
+        impl TestStream {
+            fn new(data: &[u8]) -> Self {
+                Self {
+                    data: data.to_vec(),
+                    position: 0,
+                }
+            }
+        }
+
+        impl async_std::io::Read for TestStream {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                let remaining = self.data.len() - self.position;
+                let to_read = std::cmp::min(buf.len(), remaining);
+
+                if to_read > 0 {
+                    buf[..to_read]
+                        .copy_from_slice(&self.data[self.position..self.position + to_read]);
+                    self.position += to_read;
+                }
+
+                std::task::Poll::Ready(Ok(to_read))
+            }
+        }
+
+        impl async_std::io::Write for TestStream {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "TestStream is read-only",
+                )))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        impl crate::stream::RWStream for TestStream {}
+
+        // Test data
+        let data = b"Hello, World! This is test data for body_bytes method.";
+        let test_stream = TestStream::new(data);
+        let boxed_stream = Box::new(test_stream) as BoxedStream;
+
+        // Create a response with content-length
+        let mut headers = hashbrown::HashMap::new();
+        let mut content_length_set = indexmap::IndexSet::new();
+        content_length_set.insert(data.len().to_string());
+        headers.insert("content-length".to_string(), content_length_set);
+
+        let mut response = Response {
+            addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+            is_tls: false,
+            body_successfully_readed: false,
+            http_version: HttpVersion::V1_1,
+            status_code: 200,
+            headers,
+            body_raw_stream: Some(boxed_stream),
+            proxy_used: None,
+        };
+
+        // Test body_bytes method
+        let result = async_std::task::block_on(response.body_bytes());
+        assert!(result.is_ok());
+        let bytes = result.unwrap();
+        assert_eq!(bytes, data);
+    }
+
+    #[test]
+    fn test_body_json_method() {
+        use async_std::io::ReadExt;
+
+        // Create a test stream with JSON data
+        struct TestStream {
+            data: Vec<u8>,
+            position: usize,
+        }
+
+        impl TestStream {
+            fn new(data: &[u8]) -> Self {
+                Self {
+                    data: data.to_vec(),
+                    position: 0,
+                }
+            }
+        }
+
+        impl async_std::io::Read for TestStream {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                let remaining = self.data.len() - self.position;
+                let to_read = std::cmp::min(buf.len(), remaining);
+
+                if to_read > 0 {
+                    buf[..to_read]
+                        .copy_from_slice(&self.data[self.position..self.position + to_read]);
+                    self.position += to_read;
+                }
+
+                std::task::Poll::Ready(Ok(to_read))
+            }
+        }
+
+        impl async_std::io::Write for TestStream {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "TestStream is read-only",
+                )))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        impl crate::stream::RWStream for TestStream {}
+
+        // Test JSON data
+        let json_data = br#"{"name": "test", "value": 42, "active": true}"#;
+        let test_stream = TestStream::new(json_data);
+        let boxed_stream = Box::new(test_stream) as BoxedStream;
+
+        // Create a response with JSON content
+        let mut headers = hashbrown::HashMap::new();
+        let mut content_length_set = indexmap::IndexSet::new();
+        content_length_set.insert(json_data.len().to_string());
+        headers.insert("content-length".to_string(), content_length_set);
+
+        let mut response = Response {
+            addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+            is_tls: false,
+            body_successfully_readed: false,
+            http_version: HttpVersion::V1_1,
+            status_code: 200,
+            headers,
+            body_raw_stream: Some(boxed_stream),
+            proxy_used: None,
+        };
+
+        // Test body_json method
+        let result = async_std::task::block_on(response.body_json());
+        assert!(result.is_ok());
+        let json_value = result.unwrap();
+        
+        // Verify JSON parsing
+        assert_eq!(json_value["name"], "test");
+        assert_eq!(json_value["value"], 42);
+        assert_eq!(json_value["active"], true);
+    }
+
+    #[test]
+    fn test_body_json_invalid_json() {
+        use async_std::io::ReadExt;
+
+        // Create a test stream with invalid JSON data
+        struct TestStream {
+            data: Vec<u8>,
+            position: usize,
+        }
+
+        impl TestStream {
+            fn new(data: &[u8]) -> Self {
+                Self {
+                    data: data.to_vec(),
+                    position: 0,
+                }
+            }
+        }
+
+        impl async_std::io::Read for TestStream {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                let remaining = self.data.len() - self.position;
+                let to_read = std::cmp::min(buf.len(), remaining);
+
+                if to_read > 0 {
+                    buf[..to_read]
+                        .copy_from_slice(&self.data[self.position..self.position + to_read]);
+                    self.position += to_read;
+                }
+
+                std::task::Poll::Ready(Ok(to_read))
+            }
+        }
+
+        impl async_std::io::Write for TestStream {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "TestStream is read-only",
+                )))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        impl crate::stream::RWStream for TestStream {}
+
+        // Test invalid JSON data
+        let invalid_json = b"{ invalid json }";
+        let test_stream = TestStream::new(invalid_json);
+        let boxed_stream = Box::new(test_stream) as BoxedStream;
+
+        let mut response = Response {
+            addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+            is_tls: false,
+            body_successfully_readed: false,
+            http_version: HttpVersion::V1_1,
+            status_code: 200,
+            headers: hashbrown::HashMap::new(),
+            body_raw_stream: Some(boxed_stream),
+            proxy_used: None,
+        };
+
+        // Test body_json method with invalid JSON
+        let result = async_std::task::block_on(response.body_json());
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("JSON parsing failed"));
     }
 }
