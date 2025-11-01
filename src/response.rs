@@ -22,7 +22,6 @@ pub struct ChunkedDecoderStream {
     state: DecoderState,
     chunk_remaining: usize,
     line_buffer: Vec<u8>,
-    eof_reached: bool,
     /// Internal buffer for chunk trailer reading
     trailer_buffer: Vec<u8>,
     /// Shared flag to track if the stream was fully consumed
@@ -37,7 +36,6 @@ pub struct ChunkedDecoderStream {
 pub struct BodyFixedLengthStream {
     inner: Option<BoxedStream>,
     remaining: usize,
-    eof_reached: bool,
     /// Shared flag to track if the stream was fully consumed
     completion_flag: Arc<AtomicBool>,
     /// Connection info for returning to pool
@@ -61,7 +59,6 @@ impl ChunkedDecoderStream {
             state: DecoderState::ReadingChunkSize,
             chunk_remaining: 0,
             line_buffer: Vec::new(),
-            eof_reached: false,
             trailer_buffer: Vec::new(),
             completion_flag: Arc::new(AtomicBool::new(false)),
             addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -76,7 +73,6 @@ impl ChunkedDecoderStream {
             state: DecoderState::ReadingChunkSize,
             chunk_remaining: 0,
             line_buffer: Vec::new(),
-            eof_reached: false,
             trailer_buffer: Vec::new(),
             completion_flag,
             addr,
@@ -170,14 +166,13 @@ impl async_std::io::Read for ChunkedDecoderStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        if self.eof_reached {
+        if self.completion_flag.load(Ordering::Relaxed) {
             return std::task::Poll::Ready(Ok(0));
         }
 
         loop {
             match &self.state {
                 DecoderState::Complete => {
-                    self.eof_reached = true;
                     self.completion_flag.store(true, Ordering::Relaxed);
                     self.return_stream_to_pool();
                     return std::task::Poll::Ready(Ok(0));
@@ -193,7 +188,6 @@ impl async_std::io::Read for ChunkedDecoderStream {
                         Ok(false) => {
                             // Final chunk reached, we're done
                             self.state = DecoderState::Complete;
-                            self.eof_reached = true;
                             self.completion_flag.store(true, Ordering::Relaxed);
                             self.return_stream_to_pool();
                             return std::task::Poll::Ready(Ok(0));
@@ -295,7 +289,6 @@ impl BodyFixedLengthStream {
         Self {
             inner: Some(inner),
             remaining: content_length,
-            eof_reached: false,
             completion_flag: Arc::new(AtomicBool::new(false)),
             addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
             is_tls: false,
@@ -307,7 +300,6 @@ impl BodyFixedLengthStream {
         Self {
             inner: Some(inner),
             remaining: content_length,
-            eof_reached: false,
             completion_flag,
             addr,
             is_tls,
@@ -344,8 +336,7 @@ impl async_std::io::Read for BodyFixedLengthStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        if self.eof_reached || self.remaining == 0 {
-            self.eof_reached = true;
+        if self.completion_flag.load(Ordering::Relaxed) || self.remaining == 0 {
             self.completion_flag.store(true, Ordering::Relaxed);
             self.return_stream_to_pool();
             return std::task::Poll::Ready(Ok(0));
@@ -353,7 +344,6 @@ impl async_std::io::Read for BodyFixedLengthStream {
 
         let to_read = std::cmp::min(buf.len(), self.remaining);
         if to_read == 0 {
-            self.eof_reached = true;
             self.completion_flag.store(true, Ordering::Relaxed);
             self.return_stream_to_pool();
             return std::task::Poll::Ready(Ok(0));
@@ -363,13 +353,11 @@ impl async_std::io::Read for BodyFixedLengthStream {
             match std::pin::Pin::new(inner_stream).poll_read(cx, &mut buf[..to_read]) {
                 std::task::Poll::Ready(Ok(n)) => {
                     if n == 0 {
-                        self.eof_reached = true;
                         return std::task::Poll::Ready(Ok(0));
                     }
 
                     self.remaining -= n;
                     if self.remaining == 0 {
-                        self.eof_reached = true;
                         self.completion_flag.store(true, Ordering::Relaxed);
                         self.return_stream_to_pool();
                     }
