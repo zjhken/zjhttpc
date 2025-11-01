@@ -519,7 +519,16 @@ where
 }
 
 pub fn return_stream_to_pool(resp: &mut Response) {
-    if !resp.body_successfully_readed {
+    // Check if the body was consumed either through body_string() or through managed stream
+    let body_consumed = if resp.body_successfully_readed {
+        true
+    } else if let Some(_) = resp.stream_completion_flag {
+        resp.is_stream_fully_consumed()
+    } else {
+        false
+    };
+    
+    if !body_consumed {
         // TODO: for now just close the connection
         // in the future we can try to drain it with timeout
         // but during the data reading, we have to consider the content-length and transfer-encoding
