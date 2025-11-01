@@ -525,7 +525,7 @@ pub fn return_stream_to_pool(resp: &mut Response) {
         // but during the data reading, we have to consider the content-length and transfer-encoding
         return;
     }
-    if let Some(stream) = resp.body_stream.take() {
+    if let Some(stream) = resp.body_raw_stream.take() {
         // If proxy was used, return to proxy pool
         if let Some(proxy) = &resp.proxy_used {
             let proxy_addr = proxy.addr;
