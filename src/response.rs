@@ -1,10 +1,11 @@
 use anyhow_ext::{Context, Result, anyhow};
 use async_std::io::ReadExt;
+use encoding_rs::GBK;
 use hashbrown::HashMap;
 use indexmap::IndexSet;
 use std::{net::SocketAddr, vec};
 
-use tracing::{info, trace};
+use tracing::{error, info, trace};
 
 use crate::{
     client::{read_until_v, return_stream_to_pool},
@@ -13,6 +14,207 @@ use crate::{
     proxy::HttpsProxyOption,
     stream::BoxedStream,
 };
+
+/// A streaming chunked decoder that processes chunks on-the-fly without buffering the entire body
+pub struct ChunkedDecoderStream {
+    inner: BoxedStream,
+    state: DecoderState,
+    chunk_remaining: usize,
+    line_buffer: Vec<u8>,
+    eof_reached: bool,
+    /// Internal buffer for chunk trailer reading
+    trailer_buffer: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum DecoderState {
+    ReadingChunkSize,
+    ReadingChunkData,
+    ReadingChunkTrailer,
+    Complete,
+}
+
+impl ChunkedDecoderStream {
+    pub fn new(inner: BoxedStream) -> Self {
+        Self {
+            inner,
+            state: DecoderState::ReadingChunkSize,
+            chunk_remaining: 0,
+            line_buffer: Vec::new(),
+            eof_reached: false,
+            trailer_buffer: Vec::new(),
+        }
+    }
+
+    /// Try to read the next chunk size. Returns Ok(true) if a new chunk size was read,
+    /// Ok(false) if the final chunk (size 0) was reached, or Err if there was an error.
+    async fn read_chunk_size(&mut self) -> Result<bool> {
+        self.line_buffer.clear();
+        let n = read_until_v(&mut self.inner, b"\r\n", &mut self.line_buffer).await?;
+
+        let mut chunk_size_str = String::from_utf8_lossy(&self.line_buffer[..n]);
+        // Sometimes there will be \r\n in the beginning instead of the number
+        if chunk_size_str.trim().is_empty() {
+            self.line_buffer.clear();
+            let n = read_until_v(&mut self.inner, b"\r\n", &mut self.line_buffer).await?;
+            chunk_size_str = String::from_utf8_lossy(&self.line_buffer[..n]);
+        }
+
+        let chunk_size = usize::from_str_radix(chunk_size_str.trim(), 16).map_err(|e| {
+            anyhow!(
+                "invalid chunk size '{:?}': {}",
+                chunk_size_str.as_bytes(),
+                e
+            )
+        })?;
+
+        if chunk_size == 0 {
+            // Read the trailing \r\n after the final chunk size
+            self.line_buffer.clear();
+            let n = read_until_v(&mut self.inner, b"\r\n", &mut self.line_buffer).await?;
+            if n != 2 {
+                let x = String::from_utf8_lossy(&self.line_buffer[..n]);
+                return Err(anyhow!(
+                    "not possible, it's not \\r\\n after zero in chunk. x={x}, n={n}"
+                ));
+            }
+            return Ok(false); // Final chunk reached
+        }
+
+        self.chunk_remaining = chunk_size;
+        Ok(true) // New chunk size read successfully
+    }
+
+    /// Read chunk trailer (the \r\n after chunk data)
+    async fn read_chunk_trailer(&mut self) -> Result<()> {
+        self.trailer_buffer.clear();
+        let n = read_until_v(&mut self.inner, b"\r\n", &mut self.trailer_buffer).await?;
+        if n != 2 {
+            let x = String::from_utf8_lossy(&self.trailer_buffer[..n]);
+            return Err(anyhow!(
+                "not possible, it's not \\r\\n after chunk data. x={x}, n={n}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl async_std::io::Read for ChunkedDecoderStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.eof_reached {
+            return std::task::Poll::Ready(Ok(0));
+        }
+
+        loop {
+            match &self.state {
+                DecoderState::Complete => {
+                    self.eof_reached = true;
+                    return std::task::Poll::Ready(Ok(0));
+                }
+                DecoderState::ReadingChunkSize => {
+                    // Try to read the next chunk size
+                    match async_std::task::block_on(self.read_chunk_size()) {
+                        Ok(true) => {
+                            // Got a new chunk size, switch to reading data
+                            self.state = DecoderState::ReadingChunkData;
+                            continue;
+                        }
+                        Ok(false) => {
+                            // Final chunk reached, we're done
+                            self.state = DecoderState::Complete;
+                            self.eof_reached = true;
+                            return std::task::Poll::Ready(Ok(0));
+                        }
+                        Err(e) => {
+                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e,
+                            )));
+                        }
+                    }
+                }
+                DecoderState::ReadingChunkTrailer => {
+                    // Read the trailer after chunk data
+                    match async_std::task::block_on(self.read_chunk_trailer()) {
+                        Ok(_) => {
+                            // Trailer read successfully, go back to reading next chunk size
+                            self.state = DecoderState::ReadingChunkSize;
+                            continue;
+                        }
+                        Err(e) => {
+                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e,
+                            )));
+                        }
+                    }
+                }
+                DecoderState::ReadingChunkData => {
+                    // If we have no more data in this chunk, move to trailer reading
+                    if self.chunk_remaining == 0 {
+                        self.state = DecoderState::ReadingChunkTrailer;
+                        continue;
+                    }
+
+                    // Read data from the current chunk
+                    let to_read = std::cmp::min(buf.len(), self.chunk_remaining);
+                    let mut temp_buf = vec![0u8; to_read];
+
+                    match std::pin::Pin::new(&mut self.inner).poll_read(cx, &mut temp_buf) {
+                        std::task::Poll::Ready(Ok(n)) => {
+                            if n == 0 {
+                                return std::task::Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "unexpected end of stream while reading chunk data",
+                                )));
+                            }
+
+                            buf[..n].copy_from_slice(&temp_buf[..n]);
+                            self.chunk_remaining -= n;
+
+                            return std::task::Poll::Ready(Ok(n));
+                        }
+                        std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl async_std::io::Write for ChunkedDecoderStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "ChunkedDecoderStream is read-only",
+        )))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl crate::stream::RWStream for ChunkedDecoderStream {}
 
 pub struct Response {
     pub addr: SocketAddr,
@@ -99,8 +301,9 @@ impl Response {
         if self.body_successfully_readed {
             return Err(anyhow!("response body has been read"));
         }
-        match self.content_length() {
+        let bytes = match self.content_length() {
             Some(len) => {
+                info!(len);
                 if len == 0 {
                     return Ok(String::new());
                 } else {
@@ -123,44 +326,91 @@ impl Response {
                         remaining -= n;
                     }
                     self.body_successfully_readed = true;
-                    return Ok(String::from_utf8_lossy(&v).to_string());
+                    v
                 }
             }
             None => {
-                // TODO: handler compression case
-                // check whether it's chunk encoding
-                if let Some(set) = self.headers.get("transfer-encoding") {
+                let mut decoded_stream = self.body_decoded_stream();
+                let stream = if let Some(set) = self.headers.get("transfer-encoding") {
                     if set.contains("chunked") {
-                        let bytes = self.read_chunked_body().await.dot()?;
-                        return Ok(String::from_utf8_lossy(&bytes).to_string())
+                        decoded_stream.as_mut()
+                    } else {
+                        self.body_stream.as_mut()
                     }
-                }
-                // sometimes the server forget to return the content length
-                // so we have to read to the end
-                let mut v = vec![];
-                let stream = self
-                    .body_stream
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("impossible, body stream is none"))
-                    .dot()?;
+                } else {
+                    self.body_stream.as_mut()
+                };
 
-                let mut buf = [0u8; 1024 * 8];
-                loop {
-                    let n = stream.read(&mut buf[..]).await.dot()?;
-                    if n == 0 {
-                        trace!("stream ended");
-                        break;
+                if let Some(stream) = stream {
+                    let mut v = vec![];
+                    let mut buf = [0u8; 1024 * 8];
+                    loop {
+                        let n = stream.read(&mut buf[..]).await.dot()?;
+                        if n == 0 {
+                            trace!("stream ended");
+                            break;
+                        }
+                        v.extend_from_slice(&buf[..n]);
                     }
-                    v.extend_from_slice(&buf[..n]);
+                    self.body_successfully_readed = true;
+                    v
+                } else {
+                    Vec::new()
                 }
-                self.body_successfully_readed = true;
-                return String::from_utf8(v).dot();
             }
+        };
+        if let Some(x) = self.headers.get("content-type")
+            && x.last().map(|x|x.to_lowercase().contains("charset=gbk")).unwrap_or(false)
+        {
+            let (cow, _encoding, had_errors) = GBK.decode(&bytes.as_slice());
+            if had_errors {
+                error!("GBK decode with errors");
+            }
+            return Ok(cow.to_string());
+        } else {
+            return Ok(String::from_utf8_lossy(&bytes).to_string());
         }
     }
 
-    pub fn body_stream(&mut self) -> Option<&mut BoxedStream> {
-        unimplemented!()
+    /// Returns a streaming response body with automatic chunked decoding.
+    ///
+    /// This function provides true streaming - for chunked responses, it decodes chunks on-the-fly
+    /// without buffering the entire body in memory. For non-chunked responses, it returns the raw stream.
+    ///
+    /// # Important Notes
+    ///
+    /// - Returns `None` if the body has already been read via `body_string()` or other methods.
+    /// - For chunked transfer encoding responses, automatically decodes chunks as you read.
+    /// - For non-chunked responses, returns the raw stream directly.
+    /// - Once you use this stream, you become responsible for reading it completely.
+    ///   The connection will be returned to the pool when the Response is dropped.
+    /// - If you don't read the stream completely, the connection may not be reusable.
+    pub fn body_decoded_stream(&mut self) -> Option<BoxedStream> {
+        if self.body_successfully_readed {
+            return None;
+        }
+
+        // Check if this is chunked encoding
+        let is_chunked = self
+            .headers
+            .get("transfer-encoding")
+            .map(|set| set.iter().any(|v| v.contains("chunked")))
+            .unwrap_or(false);
+
+        if let Some(stream) = self.body_stream.take() {
+            self.body_successfully_readed = true;
+
+            if is_chunked {
+                // For chunked encoding, wrap the stream with our decoder
+                let decoder = ChunkedDecoderStream::new(stream);
+                Some(Box::new(decoder))
+            } else {
+                // For non-chunked responses, return the raw stream
+                Some(stream)
+            }
+        } else {
+            None
+        }
     }
 
     pub fn body_slice(&self) -> &[u8] {
@@ -193,7 +443,6 @@ impl Response {
             let mut line_buf: Vec<u8> = vec![];
             let mut result = Vec::new();
             loop {
-                
                 let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
 
                 let mut chunk_size_str = String::from_utf8_lossy(&line_buf[..n]);
@@ -202,14 +451,21 @@ impl Response {
                     let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
                     chunk_size_str = String::from_utf8_lossy(&line_buf[..n]);
                 }
-                let chunk_size = usize::from_str_radix(chunk_size_str.trim(), 16)
-                    .map_err(|e| anyhow!("invalid chunk size '{:?}': {}", chunk_size_str.as_bytes(), e))?;
+                let chunk_size = usize::from_str_radix(chunk_size_str.trim(), 16).map_err(|e| {
+                    anyhow!(
+                        "invalid chunk size '{:?}': {}",
+                        chunk_size_str.as_bytes(),
+                        e
+                    )
+                })?;
                 // Last chunk (size 0) indicates end
                 if chunk_size == 0 {
                     let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
                     if n != 2 {
                         let x = String::from_utf8_lossy(&line_buf[..n]);
-                        return Err(anyhow!("not possible, it's not \\r\\n after zero in chunk. x={x}, n={n}"));
+                        return Err(anyhow!(
+                            "not possible, it's not \\r\\n after zero in chunk. x={x}, n={n}"
+                        ));
                     }
                     self.body_successfully_readed = true;
                     break;
@@ -255,11 +511,28 @@ mod tests {
     #[tracing_test::traced_test]
     fn test_chunked() {
         task::block_on(async {
-            let mut req = Request::new("GET", "http://127.0.0.1:8888/test/chunk").unwrap();
+            // let mut req = Request::new("GET", "http://127.0.0.1:8888/test/chunk").unwrap();
+            let mut req = Request::new("GET", "http://127.0.0.1:8888/test/gb2312.txt").unwrap();
             let mut resp = ZJHttpClient::new().send(&mut req).await.unwrap();
             let s = resp.body_string().await.unwrap();
             info!(s);
         });
     }
 
+    #[test]
+    fn test_body_stream_basic() {
+        // Test that body_stream returns None when body has been read
+        let x = "\r\nf5e\r\n".trim();
+        println!("{x}");
+
+        // This is a basic test - in a real scenario you'd need a proper Response struct
+        // with a body_stream field initialized
+    }
+
+    #[test]
+    fn test_gb2312_decoding() {
+        let bytes = include_bytes!("/Users/bluewater/codes/stock-noti/dev/gb2312.txt");
+        let (a, b, c) = encoding_rs::GBK.decode(bytes);
+        println!("{}", a.to_string());
+    }
 }

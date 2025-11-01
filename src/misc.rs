@@ -1,5 +1,6 @@
 
 
+#[derive(Clone)]
 pub enum HttpVersion {
     V1_0,
     V1_1,
