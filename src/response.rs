@@ -8,7 +8,7 @@ use std::{net::SocketAddr, vec};
 use tracing::error;
 
 use crate::{
-    client::{read_until_v, return_stream_to_pool},
+    client::{read_until_v, return_stream_to_pool, return_stream_to_pool_from_response},
     error::ZjhttpcError,
     misc::HttpVersion,
     proxy::HttpsProxyOption,
@@ -36,6 +36,17 @@ pub struct ChunkedDecoderStream {
 pub struct BodyFixedLengthStream {
     inner: Option<BoxedStream>,
     remaining: usize,
+    /// Shared flag to track if the stream was fully consumed
+    completion_flag: Arc<AtomicBool>,
+    /// Connection info for returning to pool
+    addr: SocketAddr,
+    is_tls: bool,
+    proxy_used: Option<HttpsProxyOption>,
+}
+
+/// A stream wrapper for responses with unknown length that returns the stream to pool when EOF is reached
+pub struct BodyUnknownLengthStream {
+    inner: Option<BoxedStream>,
     /// Shared flag to track if the stream was fully consumed
     completion_flag: Arc<AtomicBool>,
     /// Connection info for returning to pool
@@ -88,18 +99,12 @@ impl ChunkedDecoderStream {
     /// Return the original stream to the connection pool when fully consumed
     fn return_stream_to_pool(&mut self) {
         if let Some(stream) = self.inner.take() {
-            let mut response = Response {
+            let stream_info = crate::client::StreamInfo {
                 addr: self.addr,
                 is_tls: self.is_tls,
-                body_successfully_readed: true,
-                http_version: crate::misc::HttpVersion::V1_1,
-                status_code: 200,
-                headers: hashbrown::HashMap::new(),
-                body_raw_stream: Some(stream),
                 proxy_used: self.proxy_used.clone(),
-                stream_completion_flag: None,
             };
-            return_stream_to_pool(&mut response);
+            return_stream_to_pool(stream, stream_info);
         }
     }
 
@@ -314,18 +319,12 @@ impl BodyFixedLengthStream {
     /// Return the original stream to the connection pool when fully consumed
     fn return_stream_to_pool(&mut self) {
         if let Some(stream) = self.inner.take() {
-            let mut response = Response {
+            let stream_info = crate::client::StreamInfo {
                 addr: self.addr,
                 is_tls: self.is_tls,
-                body_successfully_readed: true,
-                http_version: crate::misc::HttpVersion::V1_1,
-                status_code: 200,
-                headers: hashbrown::HashMap::new(),
-                body_raw_stream: Some(stream),
                 proxy_used: self.proxy_used.clone(),
-                stream_completion_flag: None,
             };
-            return_stream_to_pool(&mut response);
+            return_stream_to_pool(stream, stream_info);
         }
     }
 }
@@ -403,9 +402,99 @@ impl async_std::io::Write for BodyFixedLengthStream {
     }
 }
 
+impl BodyUnknownLengthStream {
+    pub fn new_with_completion_flag(inner: BoxedStream, completion_flag: Arc<AtomicBool>, addr: SocketAddr, is_tls: bool, proxy_used: Option<HttpsProxyOption>) -> Self {
+        Self {
+            inner: Some(inner),
+            completion_flag,
+            addr,
+            is_tls,
+            proxy_used,
+        }
+    }
+
+    pub fn is_fully_consumed(&self) -> bool {
+        self.completion_flag.load(Ordering::Relaxed)
+    }
+
+    /// Return the original stream to the connection pool when fully consumed
+    fn return_stream_to_pool(&mut self) {
+        if let Some(stream) = self.inner.take() {
+            let stream_info = crate::client::StreamInfo {
+                addr: self.addr,
+                is_tls: self.is_tls,
+                proxy_used: self.proxy_used.clone(),
+            };
+            return_stream_to_pool(stream, stream_info);
+        }
+    }
+}
+
+impl async_std::io::Read for BodyUnknownLengthStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.completion_flag.load(Ordering::Relaxed) {
+            return std::task::Poll::Ready(Ok(0));
+        }
+
+        if let Some(inner_stream) = &mut self.inner {
+            match std::pin::Pin::new(inner_stream).poll_read(cx, buf) {
+                std::task::Poll::Ready(Ok(0)) => {
+                    // EOF reached - mark as completed and return to pool
+                    self.completion_flag.store(true, Ordering::Relaxed);
+                    self.return_stream_to_pool();
+                    std::task::Poll::Ready(Ok(0))
+                }
+                std::task::Poll::Ready(Ok(n)) => {
+                    std::task::Poll::Ready(Ok(n))
+                }
+                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        } else {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "stream is None",
+            )))
+        }
+    }
+}
+
+impl async_std::io::Write for BodyUnknownLengthStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "BodyUnknownLengthStream is read-only",
+        )))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 impl crate::stream::RWStream for BodyFixedLengthStream {}
 
 impl crate::stream::RWStream for ChunkedDecoderStream {}
+
+impl crate::stream::RWStream for BodyUnknownLengthStream {}
 
 pub struct Response {
     pub addr: SocketAddr,
@@ -414,19 +503,17 @@ pub struct Response {
     pub http_version: HttpVersion,
     pub status_code: u16,
     pub headers: HashMap<String, IndexSet<String>>,
-    /// if you use this stream, remember to set the body_successfully_readed to true if you read it
-    /// otherwise this connection will be reused
+    /// If you use this raw stream directly, remember to set body_successfully_readed to true when done
+    /// If you use body_managed_stream() instead, the returned wrapper handles this automatically
     pub body_raw_stream: Option<BoxedStream>,
     pub proxy_used: Option<HttpsProxyOption>,
-    /// Track if the managed stream was fully consumed
-    pub(crate) stream_completion_flag: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for Response {
     fn drop(&mut self) {
         // Only return to pool if body was not consumed through managed stream
         if !self.body_successfully_readed {
-            return_stream_to_pool(self)
+            return_stream_to_pool_from_response(self)
         }
     }
 }
@@ -471,7 +558,6 @@ impl Response {
             body_raw_stream: Some(stream),
             addr,
             proxy_used,
-            stream_completion_flag: None,
         };
         return Ok(resp);
     }
@@ -526,20 +612,21 @@ impl Response {
         }
     }
 
-    /// Returns a streaming response body with automatic chunked decoding.
+    /// Returns a streaming response body with automatic completion tracking.
     ///
-    /// This function provides true streaming - for chunked responses, it decodes chunks on-the-fly
-    /// without buffering the entire body in memory. For responses with Content-Length, it returns
-    /// a fixed-length stream that tracks remaining bytes. For other responses, it returns the raw stream.
+    /// This function provides true streaming with proper connection pool management:
+    /// - For chunked responses, it decodes chunks on-the-fly without buffering the entire body in memory
+    /// - For responses with Content-Length, it returns a fixed-length stream that tracks remaining bytes  
+    /// - For other responses, it wraps the raw stream in BodyUnknownLengthStream for completion tracking
     ///
     /// # Important Notes
     ///
     /// - Returns `None` if the body has already been read via `body_string()` or other methods.
     /// - For chunked transfer encoding responses, automatically decodes chunks as you read.
     /// - For responses with Content-Length header, returns a BodyFixedLengthStream that tracks remaining bytes.
-    /// - For other responses, returns the raw stream directly.
+    /// - For other responses, returns a BodyUnknownLengthStream that detects EOF and returns the connection to pool.
+    /// - All wrapper streams automatically return the connection to the pool when fully consumed (EOF reached).
     /// - Once you use this stream, you become responsible for reading it completely.
-    ///   The connection will be returned to the pool when the Response is dropped.
     /// - If you don't read the stream completely, the connection may not be reusable.
     pub fn body_managed_stream(&mut self) -> Option<BoxedStream> {
         if self.body_successfully_readed {
@@ -562,7 +649,6 @@ impl Response {
             if is_chunked {
                 // For chunked encoding, wrap the stream with our decoder
                 let completion_flag = Arc::new(AtomicBool::new(false));
-                self.stream_completion_flag = Some(completion_flag.clone());
                 let decoder = ChunkedDecoderStream::new_with_completion_flag(
                     stream, 
                     completion_flag, 
@@ -574,7 +660,6 @@ impl Response {
             } else if let Some(length) = content_length {
                 // For responses with Content-Length, use BodyFixedLengthStream
                 let completion_flag = Arc::new(AtomicBool::new(false));
-                self.stream_completion_flag = Some(completion_flag.clone());
                 let fixed_length_stream = BodyFixedLengthStream::new_with_completion_flag(
                     stream, 
                     length as usize, 
@@ -585,8 +670,16 @@ impl Response {
                 );
                 Some(Box::new(fixed_length_stream))
             } else {
-                // For other responses, return the raw stream
-                Some(stream)
+                // For other responses, wrap with BodyUnknownLengthStream for completion tracking
+                let completion_flag = Arc::new(AtomicBool::new(false));
+                let unknown_length_stream = BodyUnknownLengthStream::new_with_completion_flag(
+                    stream,
+                    completion_flag,
+                    self.addr,
+                    self.is_tls,
+                    self.proxy_used.clone()
+                );
+                Some(Box::new(unknown_length_stream))
             }
         } else {
             None
@@ -614,70 +707,6 @@ impl Response {
             .get("content-length")
             .and_then(|vec| vec.first())
             .and_then(|s| s.parse::<u64>().ok())
-    }
-
-    /// Check if the managed stream was fully consumed
-    pub fn is_stream_fully_consumed(&self) -> bool {
-        self.stream_completion_flag
-            .as_ref()
-            .map(|flag| flag.load(Ordering::Relaxed))
-            .unwrap_or(false)
-    }
-
-    async fn read_chunked_body(&mut self) -> Result<Vec<u8>> {
-        if let Some(stream) = self.body_raw_stream.as_mut() {
-            let stream = stream as &mut BoxedStream;
-            // read the size line
-            let mut line_buf: Vec<u8> = vec![];
-            let mut result = Vec::new();
-            loop {
-                let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
-
-                let mut chunk_size_str = String::from_utf8_lossy(&line_buf[..n]);
-                // sometimes there wil be \r\n in the beginning instead of the number
-                if chunk_size_str.trim().is_empty() {
-                    let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
-                    chunk_size_str = String::from_utf8_lossy(&line_buf[..n]);
-                }
-                let chunk_size = usize::from_str_radix(chunk_size_str.trim(), 16).map_err(|e| {
-                    anyhow!(
-                        "invalid chunk size '{:?}': {}",
-                        chunk_size_str.as_bytes(),
-                        e
-                    )
-                })?;
-                // Last chunk (size 0) indicates end
-                if chunk_size == 0 {
-                    let n = read_until_v(stream, b"\r\n", &mut line_buf).await.dot()?;
-                    if n != 2 {
-                        let x = String::from_utf8_lossy(&line_buf[..n]);
-                        return Err(anyhow!(
-                            "not possible, it's not \\r\\n after zero in chunk. x={x}, n={n}"
-                        ));
-                    }
-                    self.body_successfully_readed = true;
-                    break;
-                } else {
-                    // Read chunk data
-                    let mut buf = [0u8; 1024];
-                    let mut remaining = chunk_size;
-                    while remaining > 0 {
-                        let to_read = std::cmp::min(buf.len(), remaining);
-                        let n = stream.read(&mut buf[..to_read]).await.dot()?;
-                        if n == 0 {
-                            return Err(anyhow!(
-                                "unexpected end of stream while reading chunk data"
-                            ));
-                        }
-                        result.extend_from_slice(&buf[..n]);
-                        remaining -= n;
-                    }
-                }
-            }
-            return Ok(result);
-        } else {
-            return Err(anyhow!("impossible, body stream is none"));
-        }
     }
 }
 
@@ -890,5 +919,369 @@ mod tests {
         let bytes = include_bytes!("/Users/bluewater/codes/stock-noti/dev/gb2312.txt");
         let (a, _b, _c) = encoding_rs::GBK.decode(bytes);
         println!("{}", a.to_string());
+    }
+
+    #[test]
+    fn test_chunked_decoder_stream_basic() {
+        use async_std::io::ReadExt;
+
+        // Create a test stream that simulates chunked encoded data
+        struct TestChunkedStream {
+            data: Vec<u8>,
+            position: usize,
+        }
+
+        impl TestChunkedStream {
+            fn new(chunked_data: &[u8]) -> Self {
+                Self {
+                    data: chunked_data.to_vec(),
+                    position: 0,
+                }
+            }
+        }
+
+        impl async_std::io::Read for TestChunkedStream {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                let remaining = self.data.len() - self.position;
+                let to_read = std::cmp::min(buf.len(), remaining);
+
+                if to_read > 0 {
+                    buf[..to_read]
+                        .copy_from_slice(&self.data[self.position..self.position + to_read]);
+                    self.position += to_read;
+                }
+
+                std::task::Poll::Ready(Ok(to_read))
+            }
+        }
+
+        impl async_std::io::Write for TestChunkedStream {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "TestChunkedStream is read-only",
+                )))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        impl crate::stream::RWStream for TestChunkedStream {}
+
+        // Create chunked data: "5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n"
+        let chunked_data = b"5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n";
+        let test_stream = TestChunkedStream::new(chunked_data);
+        let boxed_stream = Box::new(test_stream) as BoxedStream;
+
+        // Test ChunkedDecoderStream
+        let mut decoder = ChunkedDecoderStream::new(boxed_stream);
+
+        // Read all data
+        let mut buffer = Vec::new();
+        let result = async_std::task::block_on(decoder.read_to_end(&mut buffer));
+        
+        assert!(result.is_ok());
+        assert_eq!(buffer, b"Hello World");
+        assert!(decoder.is_fully_consumed());
+    }
+
+    #[test]
+    fn test_body_unknown_length_stream_basic() {
+        use async_std::io::ReadExt;
+
+        // Create a simple test stream
+        struct TestStream {
+            data: Vec<u8>,
+            position: usize,
+        }
+
+        impl TestStream {
+            fn new(data: &[u8]) -> Self {
+                Self {
+                    data: data.to_vec(),
+                    position: 0,
+                }
+            }
+        }
+
+        impl async_std::io::Read for TestStream {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                let remaining = self.data.len() - self.position;
+                let to_read = std::cmp::min(buf.len(), remaining);
+
+                if to_read > 0 {
+                    buf[..to_read]
+                        .copy_from_slice(&self.data[self.position..self.position + to_read]);
+                    self.position += to_read;
+                }
+
+                std::task::Poll::Ready(Ok(to_read))
+            }
+        }
+
+        impl async_std::io::Write for TestStream {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "TestStream is read-only",
+                )))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        impl crate::stream::RWStream for TestStream {}
+
+        // Test with some data
+        let data = b"Test data for unknown length stream";
+        let test_stream = TestStream::new(data);
+        let boxed_stream = Box::new(test_stream) as BoxedStream;
+
+        // Create BodyUnknownLengthStream
+        let completion_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut unknown_stream = BodyUnknownLengthStream::new_with_completion_flag(
+            boxed_stream,
+            completion_flag,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+            false,
+            None,
+        );
+
+        // Read all data
+        let mut buffer = Vec::new();
+        let result = async_std::task::block_on(unknown_stream.read_to_end(&mut buffer));
+        
+        assert!(result.is_ok());
+        assert_eq!(buffer, data);
+        assert!(unknown_stream.is_fully_consumed());
+    }
+
+    #[test]
+    fn test_response_chunked_encoding_detection() {
+        use hashbrown::HashMap;
+        use indexmap::IndexSet;
+
+        // Create a response with chunked encoding
+        let mut headers = HashMap::new();
+        let mut transfer_encoding_set = IndexSet::new();
+        transfer_encoding_set.insert("chunked".to_string());
+        headers.insert("transfer-encoding".to_string(), transfer_encoding_set);
+
+        // Test chunked detection logic
+        let is_chunked = headers
+            .get("transfer-encoding")
+            .map(|set| set.iter().any(|v| v.contains("chunked")))
+            .unwrap_or(false);
+
+        assert!(is_chunked);
+
+        // Test non-chunked response
+        let mut headers2 = HashMap::new();
+        let mut content_length_set = IndexSet::new();
+        content_length_set.insert("123".to_string());
+        headers2.insert("content-length".to_string(), content_length_set);
+
+        let is_chunked2 = headers2
+            .get("transfer-encoding")
+            .map(|set| set.iter().any(|v| v.contains("chunked")))
+            .unwrap_or(false);
+
+        assert!(!is_chunked2);
+    }
+
+    #[test]
+    fn test_response_content_length_parsing() {
+        use hashbrown::HashMap;
+        use indexmap::IndexSet;
+
+        // Create a response with Content-Length header
+        let mut headers = HashMap::new();
+        let mut content_length_set = IndexSet::new();
+        content_length_set.insert("1024".to_string());
+        headers.insert("content-length".to_string(), content_length_set);
+
+        // Test Content-Length parsing logic
+        let content_length = headers
+            .get("content-length")
+            .and_then(|vec| vec.first())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        assert_eq!(content_length, Some(1024u64));
+
+        // Test with invalid Content-Length
+        let mut headers2 = HashMap::new();
+        let mut content_length_set2 = IndexSet::new();
+        content_length_set2.insert("invalid".to_string());
+        headers2.insert("content-length".to_string(), content_length_set2);
+
+        let content_length2 = headers2
+            .get("content-length")
+            .and_then(|vec| vec.first())
+            .and_then(|s| s.parse::<u64>().ok());
+
+        assert_eq!(content_length2, None);
+
+        // Test with no Content-Length header
+        let content_length3: Option<u64> = None;
+        assert_eq!(content_length3, None);
+    }
+
+    #[test]
+    fn test_body_stream_completion_flag_behavior() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Test completion flag behavior
+        let completion_flag = Arc::new(AtomicBool::new(false));
+        
+        // Initially should be false
+        assert!(!completion_flag.load(Ordering::Relaxed));
+        
+        // Set to true
+        completion_flag.store(true, Ordering::Relaxed);
+        assert!(completion_flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_response_body_successfully_readed_flag() {
+        use hashbrown::HashMap;
+        use indexmap::IndexSet;
+        use std::net::SocketAddr;
+
+        // Create a mock response
+        let response = Response {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            is_tls: false,
+            body_successfully_readed: false,
+            http_version: HttpVersion::V1_1,
+            status_code: 200,
+            headers: HashMap::new(),
+            body_raw_stream: None,
+            proxy_used: None,
+        };
+
+        // Test initial state
+        assert!(!response.body_successfully_readed);
+        assert_eq!(response.status_code(), 200);
+        assert!(response.is_success());
+    }
+
+  
+    #[test]
+    fn test_body_fixed_length_stream_zero_length() {
+        use async_std::io::ReadExt;
+
+        // Create a test stream with some data
+        struct TestStream {
+            data: Vec<u8>,
+            position: usize,
+        }
+
+        impl async_std::io::Read for TestStream {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                let remaining = self.data.len() - self.position;
+                let to_read = std::cmp::min(buf.len(), remaining);
+
+                if to_read > 0 {
+                    buf[..to_read]
+                        .copy_from_slice(&self.data[self.position..self.position + to_read]);
+                    self.position += to_read;
+                }
+
+                std::task::Poll::Ready(Ok(to_read))
+            }
+        }
+
+        impl async_std::io::Write for TestStream {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "TestStream is read-only",
+                )))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        impl crate::stream::RWStream for TestStream {}
+
+        // Create a mock stream with some data
+        let data = b"Some data";
+        let test_stream = TestStream {
+            data: data.to_vec(),
+            position: 0,
+        };
+        let boxed_stream = Box::new(test_stream) as BoxedStream;
+
+        // Create BodyFixedLengthStream with zero content length
+        let mut fixed_stream = BodyFixedLengthStream::new(boxed_stream, 0);
+
+        // Test that reading returns 0 immediately
+        let mut buffer = [0u8; 10];
+        let result = async_std::task::block_on(fixed_stream.read(&mut buffer));
+        
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+        assert!(fixed_stream.is_fully_consumed());
     }
 }

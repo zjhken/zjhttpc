@@ -34,6 +34,16 @@ use tracing::{error, info, trace, warn};
 static TCP_POOL: LazyLock<DashMap<SocketAddr, Vec<BoxedStream>>> = LazyLock::new(DashMap::new);
 static TLS_POOL: LazyLock<DashMap<SocketAddr, Vec<BoxedStream>>> = LazyLock::new(DashMap::new);
 
+/// Connection metadata for returning streams to the appropriate pool
+pub struct StreamInfo {
+    /// The socket address of the remote server
+    pub addr: SocketAddr,
+    /// Whether this is a TLS connection
+    pub is_tls: bool,
+    /// Proxy configuration that was used for this connection
+    pub proxy_used: Option<HttpsProxyOption>,
+}
+
 // TODO: default value with builder
 #[derive(Builder, Default, Debug, Clone)]
 #[builder(setter(strip_option))]
@@ -518,85 +528,95 @@ where
     Ok(n)
 }
 
-pub fn return_stream_to_pool(resp: &mut Response) {
-    // Check if the body was consumed either through body_string() or through managed stream
-    let body_consumed = if resp.body_successfully_readed {
-        true
-    } else if let Some(_) = resp.stream_completion_flag {
-        resp.is_stream_fully_consumed()
+/// Return a stream to the appropriate connection pool based on its metadata
+/// 
+/// This is the preferred way to return streams to the pool as it doesn't require
+/// creating a temporary Response object.
+pub fn return_stream_to_pool(stream: BoxedStream, stream_info: StreamInfo) {
+    // If proxy was used, return to proxy pool
+    if let Some(proxy) = &stream_info.proxy_used {
+        let proxy_addr = proxy.addr;
+        if proxy.url.scheme() == "https" {
+            if let Some(mut pool) = PROXY_TLS_POOL.get_mut(&proxy_addr) {
+                let len = pool.len();
+                if len <= 30 {
+                    pool.push(stream);
+                    let len = pool.len();
+                    trace!(len, "proxy TLS stream returned to pool");
+                } else {
+                    trace!(len, "proxy TLS pool is full");
+                }
+            } else {
+                PROXY_TLS_POOL.insert(proxy_addr, vec![stream]);
+                trace!("add new vec to proxy TLS pool");
+            }
+        } else {
+            if let Some(mut pool) = PROXY_TCP_POOL.get_mut(&proxy_addr) {
+                let len = pool.len();
+                if len <= 30 {
+                    pool.push(stream);
+                    let len = pool.len();
+                    trace!(len, "proxy TCP stream returned to pool");
+                } else {
+                    trace!(len, "proxy TCP pool is full");
+                }
+            } else {
+                PROXY_TCP_POOL.insert(proxy_addr, vec![stream]);
+                trace!("add new vec to proxy TCP pool");
+            }
+        }
     } else {
-        false
-    };
-    
-    if !body_consumed {
+        // Direct connection - use existing logic
+        if stream_info.is_tls {
+            if let Some(mut pool) = TLS_POOL.get_mut(&stream_info.addr) {
+                let len = pool.len();
+                if len <= 30 {
+                    pool.push(stream);
+                    let len = pool.len();
+                    trace!(len, "tls stream returned");
+                } else {
+                    trace!(len, "tls pool is full");
+                }
+            } else {
+                TLS_POOL.insert(stream_info.addr, vec![stream]);
+                trace!("add new vec to tls pool");
+            }
+        } else if let Some(mut pool) = TCP_POOL.get_mut(&stream_info.addr) {
+            let len = pool.len();
+            if len <= 30 {
+                pool.push(stream);
+                let len = pool.len();
+                trace!(len, "tcp stream returned");
+            } else {
+                trace!(len, "tcp pool is full");
+            }
+        } else {
+            TCP_POOL.insert(stream_info.addr, vec![stream]);
+            trace!("tcp add new vec to pool");
+        }
+    }
+}
+
+/// Return a stream from a Response object to the appropriate connection pool
+/// 
+/// This function maintains backward compatibility by extracting the necessary
+/// metadata from the Response object and delegating to the new return_stream_to_pool function.
+/// The preferred approach for new code is to use return_stream_to_pool directly.
+pub fn return_stream_to_pool_from_response(resp: &mut Response) {
+    // Only return to pool if body was successfully read
+    if !resp.body_successfully_readed {
         // TODO: for now just close the connection
         // in the future we can try to drain it with timeout
         // but during the data reading, we have to consider the content-length and transfer-encoding
         return;
     }
     if let Some(stream) = resp.body_raw_stream.take() {
-        // If proxy was used, return to proxy pool
-        if let Some(proxy) = &resp.proxy_used {
-            let proxy_addr = proxy.addr;
-            if proxy.url.scheme() == "https" {
-                if let Some(mut pool) = PROXY_TLS_POOL.get_mut(&proxy_addr) {
-                    let len = pool.len();
-                    if len <= 30 {
-                        pool.push(stream);
-                        let len = pool.len();
-                        trace!(len, "proxy TLS stream returned to pool");
-                    } else {
-                        trace!(len, "proxy TLS pool is full");
-                    }
-                } else {
-                    PROXY_TLS_POOL.insert(proxy_addr, vec![stream]);
-                    trace!("add new vec to proxy TLS pool");
-                }
-            } else {
-                if let Some(mut pool) = PROXY_TCP_POOL.get_mut(&proxy_addr) {
-                    let len = pool.len();
-                    if len <= 30 {
-                        pool.push(stream);
-                        let len = pool.len();
-                        trace!(len, "proxy TCP stream returned to pool");
-                    } else {
-                        trace!(len, "proxy TCP pool is full");
-                    }
-                } else {
-                    PROXY_TCP_POOL.insert(proxy_addr, vec![stream]);
-                    trace!("add new vec to proxy TCP pool");
-                }
-            }
-        } else {
-            // Direct connection - use existing logic
-            if resp.is_tls {
-                if let Some(mut pool) = TLS_POOL.get_mut(&resp.addr) {
-                    let len = pool.len();
-                    if len <= 30 {
-                        pool.push(stream);
-                        let len = pool.len();
-                        trace!(len, "tls stream returned");
-                    } else {
-                        trace!(len, "tls pool is full");
-                    }
-                } else {
-                    TLS_POOL.insert(resp.addr, vec![stream]);
-                    trace!("add new vec to tls pool");
-                }
-            } else if let Some(mut pool) = TCP_POOL.get_mut(&resp.addr) {
-                let len = pool.len();
-                if len <= 30 {
-                    pool.push(stream);
-                    let len = pool.len();
-                    trace!(len, "tcp stream returned");
-                } else {
-                    trace!(len, "tcp pool is full");
-                }
-            } else {
-                TCP_POOL.insert(resp.addr, vec![stream]);
-                trace!("tcp add new vec to pool");
-            }
-        }
+        let stream_info = StreamInfo {
+            addr: resp.addr,
+            is_tls: resp.is_tls,
+            proxy_used: resp.proxy_used.clone(),
+        };
+        return_stream_to_pool(stream, stream_info);
     }
 }
 
