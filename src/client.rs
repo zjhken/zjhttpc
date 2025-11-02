@@ -386,8 +386,10 @@ where
         Body::Str(s) => {
             stream_to_write.write_all(s.as_bytes()).await.dot()?;
         }
+        Body::Bytes(bytes) => {
+            stream_to_write.write_all(&bytes).await.dot()?;
+        }
         Body::Form => unimplemented!(),
-        Body::ByteSlice => unimplemented!(),
     }
     Ok(())
 }

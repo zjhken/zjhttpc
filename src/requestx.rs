@@ -1,4 +1,5 @@
 use hashbrown::HashMap;
+use indexmap::IndexSet;
 use serde::Serialize;
 use url::Url;
 
@@ -16,8 +17,7 @@ use crate::{
 pub struct Request {
     pub method: &'static str,
     pub url: Url,
-    // TODO: change vec to hashSet
-    pub headers: HashMap<String, Vec<String>>,
+    pub headers: HashMap<String, IndexSet<String>>,
     pub expect_continue: bool,
     pub content_type: &'static str,
     pub basic_auth: Option<(String, String)>,
@@ -37,8 +37,8 @@ impl Request {
         let url: Url = url.as_ref().parse()?;
         let host = url.host_str().ok_or_else(|| ZjhttpcError::NoHost).dot()?;
         let mut headers = HashMap::new();
-        headers.insert("host".to_owned(), vec![host.to_owned()]);
-        headers.insert("user-agent".to_owned(), vec![format!("zjhttpc/{LIB_VERSION} (powered by Jinhui)")]);
+        headers.insert("host".to_owned(), IndexSet::from([host.to_owned()]));
+        headers.insert("user-agent".to_owned(), IndexSet::from([format!("zjhttpc/{LIB_VERSION} (powered by Jinhui)")]));
         Ok(Request {
             method,
             url,
@@ -62,10 +62,10 @@ impl Request {
 
     pub fn add_header(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
         if let Some(v) = self.headers.get_mut(key.as_ref()) {
-            v.push(value.as_ref().to_owned());
+            v.insert(value.as_ref().to_owned());
         } else {
             self.headers
-                .insert(key.as_ref().to_owned(), vec![value.as_ref().to_owned()]);
+                .insert(key.as_ref().to_owned(), IndexSet::from([value.as_ref().to_owned()]));
         }
         self
     }
@@ -73,11 +73,11 @@ impl Request {
     pub fn set_header(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
         // Set a header to the request
         self.headers
-            .insert(key.as_ref().to_owned(), vec![value.as_ref().to_owned()]);
+            .insert(key.as_ref().to_owned(), IndexSet::from([value.as_ref().to_owned()]));
         self
     }
 
-    pub fn set_headers(mut self, headers: HashMap<String, Vec<String>>) -> Self {
+    pub fn set_headers(mut self, headers: HashMap<String, IndexSet<String>>) -> Self {
         self.headers.extend(headers);
         self
     }
@@ -88,7 +88,7 @@ impl Request {
     ) -> Self {
         let map = headers
             .iter()
-            .map(|(k, v)| (k.to_owned(), vec![v.to_owned()]))
+            .map(|(k, v)| (k.to_owned(), IndexSet::from([v.to_owned()])))
             .collect::<HashMap<_, _>>();
         self.headers.extend(map);
         self
@@ -108,12 +108,12 @@ impl Request {
         self
     }
 
-    pub fn header_one(&self, _key: impl AsRef<str>) -> Option<&String> {
-        unimplemented!()
+    pub fn header_one(&self, key: impl AsRef<str>) -> Option<&String> {
+        self.headers.get(key.as_ref()).and_then(|set| set.first())
     }
 
-    pub fn header_all(&self, _key: impl AsRef<str>) -> Vec<&String> {
-        unimplemented!()
+    pub fn header_all(&self, key: impl AsRef<str>) -> Option<&IndexSet<String>> {
+        self.headers.get(key.as_ref())
     }
 
     pub fn put_expect_continue(mut self, _expect: bool) -> Self {
@@ -164,9 +164,12 @@ impl Request {
         Ok(self)
     }
 
-    pub fn body_slice(self, _body: impl AsRef<[u8]>) -> Self {
+    pub fn body_slice(mut self, body: impl AsRef<[u8]>) -> Self {
         // Set the body of the request
-        unimplemented!();
+        let bytes = body.as_ref();
+        self.content_length = bytes.len() as u64;
+        self.body = Body::Bytes(bytes.to_vec());
+        self
     }
 
     pub fn body_form(self, _form: HashMap<String, String>) -> Self {

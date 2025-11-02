@@ -9,7 +9,7 @@ pub enum HttpVersion {
 pub enum Body {
     Str(String),
     Stream(Box<dyn async_std::io::Read + Unpin + Send + Sync>),
-    ByteSlice,
+    Bytes(Vec<u8>),
     Form,
     None,
 }
