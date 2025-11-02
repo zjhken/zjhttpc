@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "zjhttpc"
-version = "0.4.2"
+version = "0.4.5"
 dependencies = [
  "anyhow",
  "anyhow_ext",
