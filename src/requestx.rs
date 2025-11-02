@@ -100,6 +100,14 @@ impl Request {
         Ok(self)
     }
 
+    pub fn add_query(mut self, key: &str, value: &str) -> Self {
+        {
+            let mut query_pairs = self.url.query_pairs_mut();
+            query_pairs.append_pair(key, value);
+        }
+        self
+    }
+
     pub fn header_one(&self, _key: impl AsRef<str>) -> Option<&String> {
         unimplemented!()
     }
@@ -277,5 +285,108 @@ mod tests {
     fn test_request_connect_timeout_default() {
         let request = Request::new("GET", "http://example.com").unwrap();
         assert_eq!(request.connect_timeout, None);
+    }
+
+    #[test]
+    fn test_add_query_to_url_without_existing_query() {
+        let request = Request::new("GET", "http://example.com")
+            .unwrap()
+            .add_query("param1", "value1")
+            .add_query("param2", "value2");
+        
+        assert_eq!(request.url.query(), Some("param1=value1&param2=value2"));
+    }
+
+    #[test]
+    fn test_add_query_to_url_with_existing_query() {
+        let request = Request::new("GET", "http://example.com?existing=test")
+            .unwrap()
+            .add_query("param1", "value1");
+        
+        assert_eq!(request.url.query(), Some("existing=test&param1=value1"));
+    }
+
+    #[test]
+    fn test_add_query_with_special_characters() {
+        let request = Request::new("GET", "http://example.com")
+            .unwrap()
+            .add_query("query", "hello world")
+            .add_query("symbol", "@#$%");
+        
+        let query = request.url.query().unwrap();
+        assert!(query.contains("query=hello+world"));
+        assert!(query.contains("symbol=%40%23%24%25"));
+    }
+
+    #[test]
+    fn test_add_query_with_empty_values() {
+        let request = Request::new("GET", "http://example.com")
+            .unwrap()
+            .add_query("empty", "")
+            .add_query("param", "value");
+        
+        assert_eq!(request.url.query(), Some("empty=&param=value"));
+    }
+
+    #[test]
+    fn test_add_query_with_duplicate_keys() {
+        let request = Request::new("GET", "http://example.com")
+            .unwrap()
+            .add_query("key", "value1")
+            .add_query("key", "value2");
+        
+        let query = request.url.query().unwrap();
+        assert!(query.contains("key=value1"));
+        assert!(query.contains("key=value2"));
+        assert_eq!(query, "key=value1&key=value2");
+    }
+
+    #[test]
+    fn test_add_query_to_https_url() {
+        let request = Request::new("GET", "https://api.example.com/endpoint")
+            .unwrap()
+            .add_query("api_key", "secret123")
+            .add_query("format", "json");
+        
+        assert_eq!(request.url.query(), Some("api_key=secret123&format=json"));
+        assert_eq!(request.url.scheme(), "https");
+        assert_eq!(request.url.path(), "/endpoint");
+    }
+
+    #[test]
+    fn test_add_query_with_path_and_fragment() {
+        let request = Request::new("GET", "http://example.com/path/to/resource#section")
+            .unwrap()
+            .add_query("filter", "all");
+        
+        assert_eq!(request.url.query(), Some("filter=all"));
+        assert_eq!(request.url.path(), "/path/to/resource");
+        assert_eq!(request.url.fragment(), Some("section"));
+    }
+
+    #[test]
+    fn test_add_query_unicode_characters() {
+        let request = Request::new("GET", "http://example.com")
+            .unwrap()
+            .add_query("emoji", "🚀")
+            .add_query("chinese", "你好");
+        
+        let query = request.url.query().unwrap();
+        assert!(query.contains("emoji=%F0%9F%9A%80"));
+        assert!(query.contains("chinese=%E4%BD%A0%E5%A5%BD"));
+    }
+
+    #[test]
+    fn test_add_query_chainable_api() {
+        let request = Request::new("GET", "http://example.com")
+            .unwrap()
+            .add_query("a", "1")
+            .add_query("b", "2")
+            .add_header("Accept", "application/json")
+            .add_query("c", "3");
+        
+        assert_eq!(request.url.query(), Some("a=1&b=2&c=3"));
+        assert!(request.headers.contains_key("Accept"));
+        assert_eq!(request.headers.get("Accept").unwrap().first().unwrap(), "application/json");
     }
 }
