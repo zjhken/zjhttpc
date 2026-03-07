@@ -7,22 +7,15 @@ use async_std::{
     io::{ReadExt, WriteExt},
     net::TcpStream,
 };
-use async_tls::{TlsConnector, client::TlsStream};
-use dashmap::DashMap;
+use async_tls::TlsConnector;
 use rustls::{Certificate, ClientConfig};
 use rustls_native_certs::load_native_certs;
 use rustls_pemfile;
-use std::sync::LazyLock;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error};
 use url::Url;
 
 use crate::misc::TrustStorePem;
 use crate::stream::BoxedStream;
-
-pub static PROXY_TLS_POOL: LazyLock<DashMap<SocketAddr, Vec<BoxedStream>>> =
-    LazyLock::new(DashMap::new);
-pub static PROXY_TCP_POOL: LazyLock<DashMap<SocketAddr, Vec<BoxedStream>>> =
-    LazyLock::new(DashMap::new);
 
 #[derive(Clone, Debug)]
 pub struct HttpsProxyOption {
@@ -169,17 +162,6 @@ impl ProxyConnector {
         target_port: u16,
         connect_timeout: Duration,
     ) -> Result<BoxedStream> {
-        if let Some(Some(mut stream_from_pool)) =
-            PROXY_TCP_POOL.get_mut(&proxy_addr).map(|mut x| x.pop())
-        {
-            if !is_proxy_stream_closed(&mut stream_from_pool).await {
-                trace!("picking up HTTP proxy stream from pool");
-                return Ok(stream_from_pool);
-            } else {
-                info!(?proxy_addr, "proxy stream was picked but it is closed");
-            }
-        }
-
         // Create TCP stream with connect timeout
         let mut tcp_stream = match async_std::future::timeout(connect_timeout, TcpStream::connect(&proxy_addr)).await {
             Ok(Ok(stream)) => stream,
@@ -243,17 +225,6 @@ impl ProxyConnector {
         target_port: u16,
         connect_timeout: Duration,
     ) -> Result<BoxedStream> {
-        if let Some(Some(mut stream_from_pool)) =
-            PROXY_TLS_POOL.get_mut(&proxy_addr).map(|mut x| x.pop())
-        {
-            if !is_proxy_stream_closed(&mut stream_from_pool).await {
-                trace!("picking up HTTPS proxy stream from pool");
-                return Ok(stream_from_pool);
-            } else {
-                info!(?proxy_addr, "proxy stream was picked but it is closed");
-            }
-        }
-
         let tls_connector: TlsConnector = self.tls_config.clone().into();
 
         // Create TCP stream with connect timeout
@@ -322,76 +293,6 @@ impl ProxyConnector {
             target_host, target_port
         );
         Ok(stream)
-    }
-
-    pub fn return_stream_to_pool(&self, stream: BoxedStream) {
-        let proxy_addr = self.proxy.addr;
-
-        if self.proxy.url.scheme() == "https" {
-            if let Some(mut pool) = PROXY_TLS_POOL.get_mut(&proxy_addr) {
-                let len = pool.len();
-                if len <= 30 {
-                    pool.push(stream);
-                    let len = pool.len();
-                    trace!(len, "proxy TLS stream returned to pool");
-                } else {
-                    trace!(len, "proxy TLS pool is full");
-                }
-            } else {
-                PROXY_TLS_POOL.insert(proxy_addr, vec![stream]);
-                trace!("add new vec to proxy TLS pool");
-            }
-        } else {
-            if let Some(mut pool) = PROXY_TCP_POOL.get_mut(&proxy_addr) {
-                let len = pool.len();
-                if len <= 30 {
-                    pool.push(stream);
-                    let len = pool.len();
-                    trace!(len, "proxy TCP stream returned to pool");
-                } else {
-                    trace!(len, "proxy TCP pool is full");
-                }
-            } else {
-                PROXY_TLS_POOL.insert(proxy_addr, vec![stream]);
-                trace!("add new vec to proxy TCP pool");
-            }
-        }
-    }
-}
-
-async fn is_proxy_stream_closed(stream: &mut BoxedStream) -> bool {
-    if let Some(stream) = stream.as_any_mut().downcast_mut::<TlsStream<TcpStream>>() {
-        return is_stream_closed_inner(stream.get_mut()).await;
-    } else if let Some(stream) = stream.as_any_mut().downcast_mut::<TcpStream>() {
-        return is_stream_closed_inner(stream).await;
-    } else {
-        tracing::warn!("downcast failed for proxy stream");
-        return true;
-    }
-
-    async fn is_stream_closed_inner(tcp: &mut TcpStream) -> bool {
-        let mut buf = [0u8; 1];
-        let result = async_std::future::timeout(Duration::from_secs(1), tcp.peek(&mut buf)).await;
-        match result {
-            Ok(result) => match result {
-                Ok(0) => {
-                    info!("read 0, proxy stream is closed");
-                    return true;
-                }
-                Ok(n) => {
-                    info!("read {n}, proxy stream is still open, but strange");
-                    return false;
-                }
-                Err(err) => {
-                    info!("get unexpected error, proxy stream closed: {err}");
-                    return true;
-                }
-            },
-            Err(_e) => {
-                trace!("timeout, proxy stream is still open");
-                return false;
-            }
-        }
     }
 }
 

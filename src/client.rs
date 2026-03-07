@@ -24,16 +24,38 @@ use std::{
 use crate::{
     body::Body,
     misc::TrustStorePem,
-    proxy::{HttpsProxyOption, ProxyConnector, PROXY_TCP_POOL, PROXY_TLS_POOL},
+    proxy::{HttpsProxyOption, ProxyConnector},
     requestx::Request,
     response::Response,
     stream::BoxedStream,
 };
 use tracing::{error, info, trace, warn};
 
-// TODO: combine TCP pool with TLS pool
-static TCP_POOL: LazyLock<DashMap<SocketAddr, Vec<BoxedStream>>> = LazyLock::new(DashMap::new);
-static TLS_POOL: LazyLock<DashMap<SocketAddr, Vec<BoxedStream>>> = LazyLock::new(DashMap::new);
+/// Connection type for pool key
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum ConnectionType {
+    /// Direct TCP connection (no proxy)
+    DirectTcp,
+    /// Direct TLS connection (no proxy)
+    DirectTls,
+    /// Connection through HTTP proxy
+    ProxyTcp(SocketAddr),
+    /// Connection through HTTPS proxy
+    ProxyTls(SocketAddr),
+}
+
+/// Key for identifying connections in the pool
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct ConnectionKey {
+    /// The remote server address
+    addr: SocketAddr,
+    /// Type of connection
+    connection_type: ConnectionType,
+}
+
+/// Unified connection pool for all connection types
+static CONNECTION_POOL: LazyLock<DashMap<ConnectionKey, Vec<BoxedStream>>> =
+    LazyLock::new(DashMap::new);
 
 /// Connection metadata for returning streams to the appropriate pool
 pub struct StreamInfo {
@@ -150,18 +172,23 @@ async fn pick_or_connect_stream(
         return Ok(stream);
     }
 
-    // Direct connection (existing logic)
+    // Direct connection
     match req.url.scheme() {
         "http" => {
-            if let Some(Some(mut stream_from_pool)) = TCP_POOL.get_mut(addr).map(|mut x| x.pop()) {
+            let key = ConnectionKey {
+                addr: *addr,
+                connection_type: ConnectionType::DirectTcp,
+            };
+
+            if let Some(Some(mut stream_from_pool)) = CONNECTION_POOL.get_mut(&key).map(|mut x| x.pop()) {
                 if !is_stream_closed(&mut stream_from_pool).await {
-                    trace!("picking up stream from pool");
+                    trace!("picking up direct TCP stream from pool");
                     return Ok(stream_from_pool);
                 } else {
                     info!(?addr, "stream was picked but it is closed");
                 }
             } else {
-                trace!(?addr, "no existing connection for this addr")
+                trace!(?addr, "no existing TCP connection for this addr")
             }
 
             // Create TCP stream with connect timeout
@@ -173,16 +200,22 @@ async fn pick_or_connect_stream(
             return Ok(Box::new(tcp_stream));
         }
         "https" => {
-            if let Some(Some(mut stream_from_pool)) = TLS_POOL.get_mut(addr).map(|mut x| x.pop()) {
+            let key = ConnectionKey {
+                addr: *addr,
+                connection_type: ConnectionType::DirectTls,
+            };
+
+            if let Some(Some(mut stream_from_pool)) = CONNECTION_POOL.get_mut(&key).map(|mut x| x.pop()) {
                 if !is_stream_closed(&mut stream_from_pool).await {
-                    info!(?addr, "picking up stream from pool");
+                    info!(?addr, "picking up direct TLS stream from pool");
                     return Ok(stream_from_pool);
                 } else {
                     info!(?addr, "stream was picked but it is closed");
                 }
             } else {
-                trace!(?addr, "no existing connection for this addr")
+                trace!(?addr, "no existing TLS connection for this addr")
             }
+
             let tls_config = create_tls_config(&client.global_trust_store_pem).dot()?;
             let tls_config = Arc::new(tls_config);
             let tls_connector: TlsConnector = tls_config.into();
@@ -676,71 +709,51 @@ where
 }
 
 /// Return a stream to the appropriate connection pool based on its metadata
-/// 
+///
 /// This is the preferred way to return streams to the pool as it doesn't require
 /// creating a temporary Response object.
 pub fn return_stream_to_pool(stream: BoxedStream, stream_info: StreamInfo) {
-    // If proxy was used, return to proxy pool
-    if let Some(proxy) = &stream_info.proxy_used {
-        let proxy_addr = proxy.addr;
-        if proxy.url.scheme() == "https" {
-            if let Some(mut pool) = PROXY_TLS_POOL.get_mut(&proxy_addr) {
-                let len = pool.len();
-                if len <= 30 {
-                    pool.push(stream);
-                    let len = pool.len();
-                    trace!(len, "proxy TLS stream returned to pool");
-                } else {
-                    trace!(len, "proxy TLS pool is full");
-                }
-            } else {
-                PROXY_TLS_POOL.insert(proxy_addr, vec![stream]);
-                trace!("add new vec to proxy TLS pool");
-            }
-        } else {
-            if let Some(mut pool) = PROXY_TCP_POOL.get_mut(&proxy_addr) {
-                let len = pool.len();
-                if len <= 30 {
-                    pool.push(stream);
-                    let len = pool.len();
-                    trace!(len, "proxy TCP stream returned to pool");
-                } else {
-                    trace!(len, "proxy TCP pool is full");
-                }
-            } else {
-                PROXY_TCP_POOL.insert(proxy_addr, vec![stream]);
-                trace!("add new vec to proxy TCP pool");
-            }
+    // Build the appropriate key based on connection metadata
+    let key = if let Some(proxy) = &stream_info.proxy_used {
+        // Proxy connection
+        match proxy.url.scheme() {
+            "https" => ConnectionKey {
+                addr: proxy.addr,
+                connection_type: ConnectionType::ProxyTls(proxy.addr),
+            },
+            _ => ConnectionKey {
+                addr: proxy.addr,
+                connection_type: ConnectionType::ProxyTcp(proxy.addr),
+            },
         }
     } else {
-        // Direct connection - use existing logic
+        // Direct connection
         if stream_info.is_tls {
-            if let Some(mut pool) = TLS_POOL.get_mut(&stream_info.addr) {
-                let len = pool.len();
-                if len <= 30 {
-                    pool.push(stream);
-                    let len = pool.len();
-                    trace!(len, "tls stream returned");
-                } else {
-                    trace!(len, "tls pool is full");
-                }
-            } else {
-                TLS_POOL.insert(stream_info.addr, vec![stream]);
-                trace!("add new vec to tls pool");
-            }
-        } else if let Some(mut pool) = TCP_POOL.get_mut(&stream_info.addr) {
-            let len = pool.len();
-            if len <= 30 {
-                pool.push(stream);
-                let len = pool.len();
-                trace!(len, "tcp stream returned");
-            } else {
-                trace!(len, "tcp pool is full");
+            ConnectionKey {
+                addr: stream_info.addr,
+                connection_type: ConnectionType::DirectTls,
             }
         } else {
-            TCP_POOL.insert(stream_info.addr, vec![stream]);
-            trace!("tcp add new vec to pool");
+            ConnectionKey {
+                addr: stream_info.addr,
+                connection_type: ConnectionType::DirectTcp,
+            }
         }
+    };
+
+    // Return stream to the unified pool
+    if let Some(mut pool) = CONNECTION_POOL.get_mut(&key) {
+        let len = pool.len();
+        if len <= 30 {
+            pool.push(stream);
+            let len = pool.len();
+            trace!(key = ?(&key.addr, &key.connection_type), len, "stream returned to pool");
+        } else {
+            trace!(key = ?(&key.addr, &key.connection_type), len, "pool is full");
+        }
+    } else {
+        CONNECTION_POOL.insert(key.clone(), vec![stream]);
+        trace!(key = ?(&key.addr, &key.connection_type), "add new vec to pool");
     }
 }
 
