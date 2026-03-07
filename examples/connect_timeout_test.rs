@@ -5,7 +5,7 @@ fn main() -> anyhow::Result<()> {
     async_std::task::block_on(async {
     // Test 1: Client-level connect timeout
     println!("Test 1: Client-level connect timeout (default 3 seconds)");
-    let client = ZJHttpClient::new();
+    let client = ZJHttpClient::builder().build().unwrap();
     let mut req = Request::new("GET", "http://httpbin.org/delay/1")?;
 
     let start = std::time::Instant::now();
@@ -19,7 +19,10 @@ fn main() -> anyhow::Result<()> {
 
     // Test 2: Client-level custom connect timeout
     println!("\nTest 2: Client-level custom connect timeout (1 second)");
-    let client = ZJHttpClient::new().set_connect_timeout(Duration::from_secs(1));
+    let client = ZJHttpClient::builder()
+        .set_global_connect_timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
     let mut req = Request::new("GET", "http://httpbin.org/delay/0.5")?;
 
     let start = std::time::Instant::now();
@@ -33,7 +36,7 @@ fn main() -> anyhow::Result<()> {
 
     // Test 3: Request-level connect timeout
     println!("\nTest 3: Request-level connect timeout (500ms)");
-    let client = ZJHttpClient::new(); // Default 3s timeout
+    let client = ZJHttpClient::builder().build().unwrap(); // Default 3s timeout
     let mut req = Request::new("GET", "http://httpbin.org/delay/0.2")?
         .set_connect_timeout(Duration::from_millis(500));
 
@@ -48,7 +51,10 @@ fn main() -> anyhow::Result<()> {
 
     // Test 4: Request-level timeout overrides client-level timeout
     println!("\nTest 4: Request-level timeout (2s) overrides client-level timeout (5s)");
-    let client = ZJHttpClient::new().set_connect_timeout(Duration::from_secs(5));
+    let client = ZJHttpClient::builder()
+        .set_global_connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     let mut req = Request::new("GET", "http://httpbin.org/delay/1")?
         .set_connect_timeout(Duration::from_secs(2));
 
@@ -63,7 +69,10 @@ fn main() -> anyhow::Result<()> {
 
     // Test 5: Timeout test with invalid/unreachable host
     println!("\nTest 5: Connect timeout with unreachable host (should timeout in 1s)");
-    let client = ZJHttpClient::new().set_connect_timeout(Duration::from_secs(1));
+    let client = ZJHttpClient::builder()
+        .set_global_connect_timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
     let mut req = Request::new("GET", "http://192.0.2.1:8080/")?; // RFC5737 test address, should be unreachable
 
     let start = std::time::Instant::now();

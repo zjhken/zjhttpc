@@ -45,27 +45,33 @@ pub struct StreamInfo {
     pub proxy_used: Option<HttpsProxyOption>,
 }
 
-// TODO: default value with builder
-#[derive(Builder, Default, Debug, Clone)]
-#[builder(setter(strip_option))]
+/// HTTP client with configurable timeouts and proxy settings
+#[derive(Builder, Debug, Clone)]
+#[builder(setter(strip_option, prefix = "set"))]
 pub struct ZJHttpClient {
     // connection_pool: unimplemented!(),
+    #[builder(default = "Duration::from_secs(30)")]
     pub global_send_header_timeout: Duration,
+    #[builder(default = "Duration::from_secs(30)")]
     pub global_read_header_timeout: Duration,
+    #[builder(default)]
     pub global_read_body_timeout: Option<Duration>,
+    #[builder(default = "Duration::from_secs(3)")]
     pub global_connect_timeout: Duration,
+    #[builder(default)]
     pub global_trust_store_pem: Option<TrustStorePem>,
+    #[builder(default)]
     pub global_proxy: Option<HttpsProxyOption>,
 }
 
 impl ZJHttpClient {
-    #[must_use]
-    pub fn new() -> ZJHttpClient {
-        ZJHttpClient {
-            global_send_header_timeout: Duration::from_secs(30),
-            global_read_header_timeout: Duration::from_secs(30),
+    /// Create a builder for ZJHttpClient with default values
+    pub fn builder() -> ZJHttpClientBuilder {
+        ZJHttpClientBuilder {
+            global_send_header_timeout: Some(Duration::from_secs(30)),
+            global_read_header_timeout: Some(Duration::from_secs(30)),
             global_read_body_timeout: None,
-            global_connect_timeout: Duration::from_secs(3),
+            global_connect_timeout: Some(Duration::from_secs(3)),
             global_trust_store_pem: None,
             global_proxy: None,
         }
@@ -906,7 +912,7 @@ mod tests {
 
     #[test]
     fn test_client_proxy_configuration() {
-        let mut client = ZJHttpClient::new();
+        let mut client = ZJHttpClient::builder().build().unwrap();
         assert!(client.global_proxy.is_none());
 
         let proxy = HttpsProxyOption::new("http://proxy.example.com:8080").unwrap();
@@ -917,7 +923,7 @@ mod tests {
 
     #[test]
     fn test_client_proxy_from_url() {
-        let result = ZJHttpClient::new().set_proxy_from_url("http://proxy.example.com:8080");
+        let result = ZJHttpClient::builder().build().unwrap().set_proxy_from_url("http://proxy.example.com:8080");
         assert!(result.is_ok());
         let client = result.unwrap();
         assert!(client.global_proxy.is_some());
@@ -926,19 +932,22 @@ mod tests {
 
     #[test]
     fn test_client_invalid_proxy_url() {
-        let result = ZJHttpClient::new().set_proxy_from_url("invalid-url");
+        let result = ZJHttpClient::builder().build().unwrap().set_proxy_from_url("invalid-url");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_client_connect_timeout_default() {
-        let client = ZJHttpClient::new();
+        let client = ZJHttpClient::builder().build().unwrap();
         assert_eq!(client.global_connect_timeout, Duration::from_secs(3));
     }
 
     #[test]
     fn test_client_connect_timeout_custom() {
-        let client = ZJHttpClient::new().set_connect_timeout(Duration::from_secs(10));
+        let client = ZJHttpClient::builder()
+            .set_global_connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
         assert_eq!(client.global_connect_timeout, Duration::from_secs(10));
     }
 

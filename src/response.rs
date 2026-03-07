@@ -861,7 +861,7 @@ mod tests {
         task::block_on(async {
             // let mut req = Request::new("GET", "http://127.0.0.1:8888/test/chunk").unwrap();
             let mut req = Request::new("GET", "http://127.0.0.1:8888/test/gb2312.txt").unwrap();
-            let mut resp = ZJHttpClient::new().send(&mut req).await.unwrap();
+            let mut resp = ZJHttpClient::builder().build().unwrap().send(&mut req).await.unwrap();
             let s = resp.body_string().await.unwrap();
             println!("{}", s);
         });

@@ -7,8 +7,10 @@ fn main() -> anyhow::Result<()> {
 
     // Test 1: HTTP proxy with client-level connect timeout
     println!("\nTest 1: HTTP proxy with client-level connect timeout (1 second)");
-    let client = ZJHttpClient::new()
-        .set_connect_timeout(Duration::from_secs(1));
+    let client = ZJHttpClient::builder()
+        .set_global_connect_timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
     let mut req = Request::new("GET", "http://httpbin.org/get")?
         .set_proxy_from_url("http://192.0.2.1:8080")?; // RFC5737 test address, should be unreachable
 
@@ -31,7 +33,7 @@ fn main() -> anyhow::Result<()> {
 
     // Test 2: HTTPS proxy with request-level connect timeout
     println!("\nTest 2: HTTPS proxy with request-level connect timeout (2 seconds)");
-    let client = ZJHttpClient::new(); // Default 3s timeout
+    let client = ZJHttpClient::builder().build().unwrap(); // Default 3s timeout
     let mut req = Request::new("GET", "http://httpbin.org/get")?
         .set_proxy_from_url("https://192.0.2.1:8443")? // RFC5737 test address, should be unreachable
         .set_connect_timeout(Duration::from_secs(2));
@@ -55,7 +57,10 @@ fn main() -> anyhow::Result<()> {
 
     // Test 3: Request-level timeout overrides client-level timeout for proxy
     println!("\nTest 3: Request-level timeout (1s) overrides client-level timeout (5s) for proxy");
-    let client = ZJHttpClient::new().set_connect_timeout(Duration::from_secs(5));
+    let client = ZJHttpClient::builder()
+        .set_global_connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
     let mut req = Request::new("GET", "http://httpbin.org/get")?
         .set_proxy_from_url("http://192.0.2.1:8080")? // RFC5737 test address, should be unreachable
         .set_connect_timeout(Duration::from_secs(1));
