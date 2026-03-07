@@ -402,32 +402,36 @@ async fn read_headers_to_resp(
 ) -> Result<Response> {
     // Determine which proxy was used (request-level takes precedence over client-level)
     let proxy_used = req.proxy.as_ref().or(client.global_proxy.as_ref()).cloned();
-    // let mut buf = [0u8; 1024 * 8];
-    let data = {
-        let fut = read_until(&mut stream, b"\r\n");
+
+    // Read all headers at once (including status line) until \r\n\r\n
+    let all_headers = {
+        let fut = read_until(&mut stream, b"\r\n\r\n");
         if let Some(dur) = req.header_timeout {
             future::timeout(dur, fut).await.dot()??
         } else {
             fut.await.dot()?
         }
     };
-    let input = std::str::from_utf8(data.as_ref()).dot()?;
-    let (_, (_, http_version, _, status_code, _)) = parse_resp_first_line(input)
+
+    let input = std::str::from_utf8(&all_headers).dot()?;
+
+    // Parse the first line (status line)
+    let (remaining, (_, http_version, _, status_code, _)) = parse_resp_first_line(input)
         .map_err(|e| {
             anyhow!(
-                "{err}:parse resp first line failed. firstLine={line}",
+                "{err}:parse resp first line failed. data={input}",
                 err = e.to_owned(),
-                line = input.to_string()
             )
         })
         .dot()?;
-    let input = read_until(&mut stream, b"\r\n\r\n").await.dot()?;
-    let input = std::str::from_utf8(input.as_ref()).dot()?;
-    let headers = parse_headers(input)
+
+    // Parse the remaining headers
+    let headers = parse_headers(remaining)
         .dot()?
         .into_iter()
         .map(|(key, value)| (key.to_ascii_lowercase(), value.to_owned()))
         .collect::<Vec<_>>();
+
     return Response::new_from_parse_result(
         http_version,
         status_code,
@@ -630,6 +634,7 @@ pub enum HttpVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_std::io::Cursor;
 
     #[test]
     fn test_parse_one_line_header_basic() {
@@ -800,5 +805,283 @@ mod tests {
     fn test_client_connect_timeout_custom() {
         let client = ZJHttpClient::new().set_connect_timeout(Duration::from_secs(10));
         assert_eq!(client.global_connect_timeout, Duration::from_secs(10));
+    }
+
+    // ==================== read_until tests ====================
+
+    #[async_std::test]
+    async fn test_read_until_basic() {
+        let data = b"Hello World\r\n";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        assert_eq!(buf, b"Hello World\r\n");
+    }
+
+    #[async_std::test]
+    async fn test_read_until_single_char_delimiter() {
+        let data = b"Hello\nWorld";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        assert_eq!(buf, b"Hello\n");
+    }
+
+    #[async_std::test]
+    async fn test_read_until_empty_delimiter() {
+        let data = b"Hello World";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        assert_eq!(buf, b"");
+    }
+
+    #[async_std::test]
+    async fn test_read_until_no_delimiter_found() {
+        let data = b"Hello World";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        assert_eq!(buf, b"Hello World");
+    }
+
+    #[async_std::test]
+    async fn test_read_until_delimiter_at_start() {
+        let data = b"\r\nHello World";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        assert_eq!(buf, b"\r\n");
+    }
+
+    #[async_std::test]
+    async fn test_read_until_empty_stream() {
+        let data = b"";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        assert_eq!(buf, b"");
+    }
+
+    #[async_std::test]
+    async fn test_read_until_multiple_delimiters() {
+        let data = b"Line1\r\nLine2\r\nLine3\r\n";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        assert_eq!(buf, b"Line1\r\n");
+    }
+
+    #[async_std::test]
+    async fn test_read_until_long_delimiter() {
+        let data = b"Some data\r\n\r\nMore data";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        assert_eq!(buf, b"Some data\r\n\r\n");
+    }
+
+    // ==================== HTTP header tests ====================
+
+    #[async_std::test]
+    async fn test_read_until_http_response_first_line() {
+        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        assert_eq!(buf, b"HTTP/1.1 200 OK\r\n");
+        let text = std::str::from_utf8(&buf).unwrap();
+        assert_eq!(text, "HTTP/1.1 200 OK\r\n");
+    }
+
+    #[async_std::test]
+    async fn test_read_until_http_headers_complete() {
+        // This is the key test - reading complete HTTP headers until \r\n\r\n
+        let data = b"HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: 1234\r\n\
+                     Connection: keep-alive\r\n\
+                     \r\n\
+                     {\"message\": \"body\"}";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+
+        // Verify we got all headers but not the body
+        assert!(text.contains("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Type: application/json\r\n"));
+        assert!(text.contains("Content-Length: 1234\r\n"));
+        assert!(text.contains("Connection: keep-alive\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+        assert!(!text.contains("{\"message\": \"body\"}"));
+    }
+
+    #[async_std::test]
+    async fn test_read_until_http_request_headers() {
+        let data = b"GET /index.html HTTP/1.1\r\n\
+                     Host: www.example.com\r\n\
+                     User-Agent: Mozilla/5.0\r\n\
+                     Accept: */*\r\n\
+                     \r\n";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+
+        assert!(text.contains("GET /index.html HTTP/1.1\r\n"));
+        assert!(text.contains("Host: www.example.com\r\n"));
+        assert!(text.contains("User-Agent: Mozilla/5.0\r\n"));
+        assert!(text.contains("Accept: */*\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    #[async_std::test]
+    async fn test_read_until_http_headers_with_special_characters() {
+        let data = b"HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/html; charset=utf-8\r\n\
+                     Set-Cookie: session=abc123; Path=/; HttpOnly\r\n\
+                     Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\r\n\
+                     \r\n";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+
+        assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(text.contains("Set-Cookie: session=abc123; Path=/; HttpOnly\r\n"));
+        assert!(text.contains("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    #[async_std::test]
+    async fn test_read_until_http_headers_multiline_value() {
+        // Test with folded header values (deprecated but still valid in some cases)
+        let data = b"HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/html\r\n\
+                     X-Custom: line1\r\n\
+                      line2\r\n\
+                     \r\n";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+
+        assert!(text.contains("HTTP/1.1 200 OK\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    #[async_std::test]
+    async fn test_read_until_http_headers_many_headers() {
+        // Test with many headers to ensure buffer can handle it
+        let mut data = String::from("HTTP/1.1 200 OK\r\n");
+        for i in 0..50 {
+            data.push_str(&format!("X-Header-{}: value{}\r\n", i, i));
+        }
+        data.push_str("\r\n");
+
+        let data_bytes = data.into_bytes();
+        let mut cursor = Cursor::new(data_bytes);
+        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+
+        assert!(text.contains("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("X-Header-0: value0\r\n"));
+        assert!(text.contains("X-Header-49: value49\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    #[async_std::test]
+    async fn test_read_until_http_headers_empty_values() {
+        let data = b"HTTP/1.1 200 OK\r\n\
+                     X-Empty-1: \r\n\
+                     X-Empty-2: \r\n\
+                     \r\n";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+
+        assert!(text.contains("X-Empty-1: \r\n"));
+        assert!(text.contains("X-Empty-2: \r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    #[async_std::test]
+    async fn test_read_until_http_response_with_chunked_encoding() {
+        let data = b"HTTP/1.1 200 OK\r\n\
+                     Transfer-Encoding: chunked\r\n\
+                     Content-Type: text/plain\r\n\
+                     \r\n\
+                     5\r\n\
+                     Hello\r\n\
+                     0\r\n\
+                     \r\n";
+        let mut cursor = Cursor::new(data);
+        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        assert!(result.is_ok());
+        let buf = result.unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+
+        assert!(text.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+        // Should not include the chunked body
+        assert!(!text.contains("5\r\n"));
+    }
+
+    // ==================== read_until_v tests ====================
+
+    #[async_std::test]
+    async fn test_read_until_v_basic() {
+        let data = b"Hello World\r\n";
+        let mut cursor = Cursor::new(data);
+        let mut buf = Vec::new();
+        let result = read_until_v(&mut cursor, b"\r\n", &mut buf).await;
+        assert!(result.is_ok());
+        let n = result.unwrap();
+        assert_eq!(n, 13); // "Hello World\r\n".len()
+        assert_eq!(buf, b"Hello World\r\n");
+    }
+
+    #[async_std::test]
+    async fn test_read_until_v_reuse_buffer() {
+        let data1 = b"First\r\n";
+        let data2 = b"Second\r\n";
+
+        let mut cursor = Cursor::new(data1);
+        let mut buf = Vec::new();
+        let result1 = read_until_v(&mut cursor, b"\r\n", &mut buf).await;
+        assert!(result1.is_ok());
+        assert_eq!(buf, b"First\r\n");
+
+        let mut cursor = Cursor::new(data2);
+        let result2 = read_until_v(&mut cursor, b"\r\n", &mut buf).await;
+        assert!(result2.is_ok());
+        assert_eq!(buf, b"Second\r\n");
+    }
+
+    #[async_std::test]
+    async fn test_read_until_v_empty_delimiter() {
+        let data = b"Hello World";
+        let mut cursor = Cursor::new(data);
+        let mut buf = Vec::new();
+        let result = read_until_v(&mut cursor, b"", &mut buf).await;
+        assert!(result.is_err());
     }
 }
