@@ -377,9 +377,32 @@ mod tests {
             .add_query("b", "2")
             .add_header("Accept", "application/json")
             .add_query("c", "3");
-        
+
         assert_eq!(request.url.query(), Some("a=1&b=2&c=3"));
         assert!(request.headers.contains_key("Accept"));
         assert_eq!(request.headers.get("Accept").unwrap().first().unwrap(), "application/json");
+    }
+
+    #[test]
+    fn test_content_type_constants() {
+        use crate::content_type;
+
+        let request = Request::new("POST", "http://example.com")
+            .unwrap()
+            .set_content_type(content_type::APPLICATION_JSON);
+
+        assert_eq!(request.content_type, "application/json");
+
+        let request = Request::new("POST", "http://example.com")
+            .unwrap()
+            .set_content_type(content_type::TEXT_HTML);
+
+        assert_eq!(request.content_type, "text/html");
+
+        let request = Request::new("POST", "http://example.com")
+            .unwrap()
+            .set_content_type(content_type::IMAGE_PNG);
+
+        assert_eq!(request.content_type, "image/png");
     }
 }

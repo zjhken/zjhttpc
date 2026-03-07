@@ -7,5 +7,6 @@ pub mod stream;
 pub mod client;
 pub mod misc;
 pub mod header;
+pub mod content_type;
 
 pub use url;
