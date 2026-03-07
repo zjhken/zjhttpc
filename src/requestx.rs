@@ -71,7 +71,6 @@ impl Request {
     }
 
     pub fn set_header(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        // Set a header to the request
         self.headers
             .insert(key.as_ref().to_owned(), IndexSet::from([value.as_ref().to_owned()]));
         self
@@ -86,11 +85,11 @@ impl Request {
         mut self,
         headers: std::collections::HashMap<String, String>,
     ) -> Self {
-        let map = headers
-            .iter()
-            .map(|(k, v)| (k.to_owned(), IndexSet::from([v.to_owned()])))
-            .collect::<HashMap<_, _>>();
-        self.headers.extend(map);
+        self.headers.extend(
+            headers
+                .into_iter()
+                .map(|(k, v)| (k, IndexSet::from([v]))),
+        );
         self
     }
 
@@ -101,10 +100,7 @@ impl Request {
     }
 
     pub fn add_query(mut self, key: &str, value: &str) -> Self {
-        {
-            let mut query_pairs = self.url.query_pairs_mut();
-            query_pairs.append_pair(key, value);
-        }
+        self.url.query_pairs_mut().append_pair(key, value);
         self
     }
 
@@ -116,7 +112,7 @@ impl Request {
         self.headers.get(key.as_ref())
     }
 
-    pub fn put_expect_continue(mut self, _expect: bool) -> Self {
+    pub fn put_expect_continue(mut self) -> Self {
         self.expect_continue = true;
         self
     }
@@ -128,17 +124,15 @@ impl Request {
 
     pub fn set_content_length(mut self, len: u64) -> Self {
         self.content_length = len;
-        return self;
+        self
     }
 
     pub fn set_basic_auth(mut self, username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
-        // Set the basic auth header
         self.basic_auth = Some((username.as_ref().to_owned(), password.as_ref().to_owned()));
         self
     }
 
     pub fn set_body_string(mut self, body: impl AsRef<str>) -> Self {
-        // Set the body of the request
         self.content_length = body.as_ref().len() as u64;
         self.body = Body::Str(body.as_ref().to_owned());
         self
@@ -154,8 +148,7 @@ impl Request {
     }
 
     pub async fn set_body_file(mut self, file_path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let p = file_path.as_ref().to_owned();
-        let p = async_std::path::PathBuf::from(p);
+        let p = async_std::path::PathBuf::from(file_path.as_ref());
         let len = p.metadata().await.dot()?.len();
         self.content_length = len;
         let file = File::open(p).await.dot()?;
@@ -164,21 +157,18 @@ impl Request {
         Ok(self)
     }
 
-    pub fn body_slice(mut self, body: impl AsRef<[u8]>) -> Self {
-        // Set the body of the request
+    pub fn set_body_slice(mut self, body: impl AsRef<[u8]>) -> Self {
         let bytes = body.as_ref();
         self.content_length = bytes.len() as u64;
         self.body = Body::Bytes(bytes.to_vec());
         self
     }
 
-    pub fn body_form(self, _form: HashMap<String, String>) -> Self {
-        // Set the body of the request
+    pub fn set_body_form(self, _form: HashMap<String, String>) -> Self {
         unimplemented!();
     }
 
-    pub fn body_multipart_form(self, _form: HashMap<String, String>) -> Self {
-        // Set the body of the request
+    pub fn set_body_multipart_form(self, _form: HashMap<String, String>) -> Self {
         unimplemented!();
     }
 
