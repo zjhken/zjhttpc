@@ -9,9 +9,9 @@ use futures::io::BufReader;
 use std::time::Duration;
 
 use crate::{
-    body::BodyForm,
+    body::{Body, BodyForm, BodyMultipartForm},
     error::ZjhttpcError,
-    misc::{Body, TrustStorePem},
+    misc::TrustStorePem,
     proxy::HttpsProxyOption,
 };
 
@@ -205,8 +205,49 @@ impl Request {
         self
     }
 
-    pub fn set_body_multipart_form(self, _form: HashMap<String, String>) -> Self {
-        unimplemented!();
+    /// Set the request body as multipart/form-data.
+    ///
+    /// This method automatically sets the Content-Type header to
+    /// "multipart/form-data; boundary=XXXX", overwriting any previous value.
+    ///
+    /// The actual serialization happens when sending the request to avoid
+    /// loading entire files into memory.
+    ///
+    /// # Arguments
+    /// * `form` - A BodyMultipartForm instance containing the form fields
+    ///
+    /// # Examples
+    /// ```
+    /// use zjhttpc::body::BodyMultipartForm;
+    /// use zjhttpc::requestx::Request;
+    /// use std::path::PathBuf;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let form = BodyMultipartForm::new()
+    ///     .add("username", "alice")
+    ///     .add("bio", "Hello, world!")
+    ///     .add_file_path("avatar", PathBuf::from("/path/to/avatar.jpg"))?;
+    ///
+    /// let request = Request::new("POST", "https://example.com/upload")?
+    ///     .set_body_multipart_form(form);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn set_body_multipart_form(mut self, form: BodyMultipartForm) -> Self {
+        // Auto-set Content-Type to multipart/form-data with boundary
+        let boundary = form.boundary().to_string();
+        self.content_type = Box::leak(
+            format!("multipart/form-data; boundary={}", boundary)
+                .into_boxed_str()
+        );
+
+        // For multipart forms, we can't know the content-length upfront
+        // without reading all files, so set to 0 (will use chunked encoding)
+        self.content_length = 0;
+        self.body = Body::MultipartForm(form);
+
+        self
     }
 
     pub fn set_header_timeout(mut self, dur: Duration) -> Self {

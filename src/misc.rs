@@ -6,14 +6,6 @@ pub enum HttpVersion {
     V1_1,
 }
 
-pub enum Body {
-    Str(String),
-    Stream(Box<dyn async_std::io::Read + Unpin + Send + Sync>),
-    Bytes(Vec<u8>),
-    Form,
-    None,
-}
-
 #[derive(Clone, Debug)]
 pub enum TrustStorePem {
     Bytes(Vec<u8>),

@@ -1,4 +1,34 @@
+use anyhow_ext::Result;
+use async_std::fs::File;
 use std::fmt;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Request body types
+pub enum Body {
+    /// String body
+    Str(String),
+    /// Stream body (for streaming data)
+    Stream(Box<dyn async_std::io::Read + Unpin + Send + Sync>),
+    /// Bytes body
+    Bytes(Vec<u8>),
+    /// Multipart form data
+    MultipartForm(BodyMultipartForm),
+    /// No body
+    None,
+}
+
+impl fmt::Debug for Body {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Body::Str(s) => f.debug_tuple("Str").field(&s.len()).finish(),
+            Body::Stream(_) => f.debug_tuple("Stream").finish(),
+            Body::Bytes(b) => f.debug_tuple("Bytes").field(&b.len()).finish(),
+            Body::MultipartForm(form) => f.debug_tuple("MultipartForm").field(&form.fields.len()).finish(),
+            Body::None => f.debug_tuple("None").finish(),
+        }
+    }
+}
 
 /// Form data for application/x-www-form-urlencoded
 #[derive(Clone, Default)]
@@ -101,6 +131,342 @@ fn url_encode(s: &str) -> String {
         }
     }
     result
+}
+
+/// Represents a single field in a multipart form
+pub enum MultipartField {
+    /// A text field with name and value
+    Text(String, String),
+    /// A file from a path: (name, path, filename, content_type)
+    /// filename and content_type are optional (auto-detected if None)
+    FilePath(String, PathBuf, Option<String>, Option<String>),
+    /// An already opened file: (name, file, filename, content_type)
+    File(String, File, Option<String>, Option<String>),
+    /// A generic stream: (name, stream, filename, content_type)
+    Stream(
+        String,
+        Box<dyn async_std::io::Read + Unpin + Send + Sync>,
+        Option<String>,
+        Option<String>,
+    ),
+}
+
+/// Multipart form data for multipart/form-data
+pub struct BodyMultipartForm {
+    pub(crate) fields: Vec<MultipartField>,
+    pub(crate) boundary: String,
+}
+
+impl BodyMultipartForm {
+    /// Create a new multipart form with auto-generated boundary
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            fields: Vec::new(),
+            boundary: generate_boundary(),
+        }
+    }
+
+    /// Add a text field to the form
+    ///
+    /// # Arguments
+    /// * `name` - Field name
+    /// * `value` - Field value
+    ///
+    /// # Examples
+    /// ```
+    /// use zjhttpc::body::BodyMultipartForm;
+    ///
+    /// let form = BodyMultipartForm::new()
+    ///     .add("username", "alice")
+    ///     .add("bio", "Hello, world!");
+    /// ```
+    #[must_use]
+    pub fn add(mut self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        self.fields.push(MultipartField::Text(
+            name.as_ref().to_owned(),
+            value.as_ref().to_owned(),
+        ));
+        self
+    }
+
+    /// Add a file from a path (auto-detect filename and content-type)
+    ///
+    /// # Arguments
+    /// * `name` - Field name
+    /// * `path` - Path to the file
+    ///
+    /// # Examples
+    /// ```
+    /// use zjhttpc::body::BodyMultipartForm;
+    /// use std::path::PathBuf;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let form = BodyMultipartForm::new()
+    ///     .add("username", "alice")
+    ///     .add_file_path("avatar", PathBuf::from("/path/to/avatar.jpg"))?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn add_file_path(
+        mut self,
+        name: impl AsRef<str>,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        let path = PathBuf::from(path.as_ref());
+        self.fields.push(MultipartField::FilePath(
+            name.as_ref().to_owned(),
+            path,
+            None,  // auto-detect filename
+            None,  // auto-detect content-type
+        ));
+        Ok(self)
+    }
+
+    /// Add a file from a path with custom filename and/or content-type
+    ///
+    /// # Arguments
+    /// * `name` - Field name
+    /// * `path` - Path to the file
+    /// * `filename` - Custom filename (None to use original filename)
+    /// * `content_type` - Custom content-type (None to auto-detect)
+    ///
+    /// # Examples
+    /// ```
+    /// use zjhttpc::body::BodyMultipartForm;
+    /// use std::path::PathBuf;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let form = BodyMultipartForm::new()
+    ///     .add_file_path_with_options(
+    ///         "avatar",
+    ///         PathBuf::from("/path/to/image"),
+    ///         Some("profile.jpg"),
+    ///         Some("image/jpeg")
+    ///     )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn add_file_path_with_options(
+        mut self,
+        name: impl AsRef<str>,
+        path: impl AsRef<std::path::Path>,
+        filename: Option<impl AsRef<str>>,
+        content_type: Option<impl AsRef<str>>,
+    ) -> Result<Self> {
+        let path = PathBuf::from(path.as_ref());
+        self.fields.push(MultipartField::FilePath(
+            name.as_ref().to_owned(),
+            path,
+            filename.map(|f| f.as_ref().to_owned()),
+            content_type.map(|c| c.as_ref().to_owned()),
+        ));
+        Ok(self)
+    }
+
+    /// Add an already opened file (auto-detect content-type if filename provided)
+    ///
+    /// # Arguments
+    /// * `name` - Field name
+    /// * `file` - Opened file handle
+    ///
+    /// # Examples
+    /// ```
+    /// use zjhttpc::body::BodyMultipartForm;
+    /// use async_std::fs::File;
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let file = File::open("/path/to/avatar.jpg").await?;
+    /// let form = BodyMultipartForm::new()
+    ///     .add("username", "alice")
+    ///     .add_file("avatar", file);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn add_file(mut self, name: impl AsRef<str>, file: File) -> Self {
+        self.fields.push(MultipartField::File(
+            name.as_ref().to_owned(),
+            file,
+            None,  // no filename info
+            None,  // no content-type info
+        ));
+        self
+    }
+
+    /// Add an already opened file with custom filename and content-type
+    ///
+    /// # Arguments
+    /// * `name` - Field name
+    /// * `file` - Opened file handle
+    /// * `filename` - Filename (required for content-type detection)
+    /// * `content_type` - Content-type (None to auto-detect from filename)
+    ///
+    /// # Examples
+    /// ```
+    /// use zjhttpc::body::BodyMultipartForm;
+    /// use async_std::fs::File;
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let file = File::open("/path/to/image").await?;
+    /// let form = BodyMultipartForm::new()
+    ///     .add_file_with_options(
+    ///         "avatar",
+    ///         file,
+    ///         Some("profile.jpg"),
+    ///         Some("image/jpeg")
+    ///     );
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn add_file_with_options(
+        mut self,
+        name: impl AsRef<str>,
+        file: File,
+        filename: Option<impl AsRef<str>>,
+        content_type: Option<impl AsRef<str>>,
+    ) -> Self {
+        self.fields.push(MultipartField::File(
+            name.as_ref().to_owned(),
+            file,
+            filename.map(|f| f.as_ref().to_owned()),
+            content_type.map(|c| c.as_ref().to_owned()),
+        ));
+        self
+    }
+
+    /// Add a generic stream with filename and content-type
+    ///
+    /// # Arguments
+    /// * `name` - Field name
+    /// * `stream` - Stream to read from
+    /// * `filename` - Filename (required, used for content-type detection)
+    /// * `content_type` - Content-type (None to auto-detect from filename)
+    ///
+    /// # Examples
+    /// ```
+    /// use zjhttpc::body::BodyMultipartForm;
+    /// use std::io::Cursor;
+    ///
+    /// let data = b"Hello, world!";
+    /// let cursor = Cursor::new(data);
+    /// let form = BodyMultipartForm::new()
+    ///     .add_stream(
+    ///         "data",
+    ///         Box::new(cursor),
+    ///         Some("data.txt"),
+    ///         Some("text/plain")
+    ///     );
+    /// ```
+    #[must_use]
+    pub fn add_stream(
+        mut self,
+        name: impl AsRef<str>,
+        stream: Box<dyn async_std::io::Read + Unpin + Send + Sync>,
+        filename: Option<impl AsRef<str>>,
+        content_type: Option<impl AsRef<str>>,
+    ) -> Self {
+        self.fields.push(MultipartField::Stream(
+            name.as_ref().to_owned(),
+            stream,
+            filename.map(|f| f.as_ref().to_owned()),
+            content_type.map(|c| c.as_ref().to_owned()),
+        ));
+        self
+    }
+
+    /// Get the boundary string for this form
+    #[must_use]
+    pub fn boundary(&self) -> &str {
+        &self.boundary
+    }
+
+    /// Get the number of fields in the form
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Check if the form is empty
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+}
+
+impl Default for BodyMultipartForm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for BodyMultipartForm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BodyMultipartForm")
+            .field("boundary", &self.boundary)
+            .field("fields_count", &self.fields.len())
+            .finish()
+    }
+}
+
+/// Generate a random boundary string for multipart form data
+fn generate_boundary() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("----Boundary{}{}", timestamp, rand_random_string(8))
+}
+
+/// Generate a random alphanumeric string
+fn rand_random_string(len: usize) -> String {
+    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut result = String::with_capacity(len);
+    for _ in 0..len {
+        let idx = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0) % CHARS.len() as u128) as usize;
+        result.push(CHARS[idx] as char);
+    }
+    result
+}
+
+/// Detect MIME type based on file extension
+pub fn detect_mime_type(filename: &str) -> &'static str {
+    if let Some(ext) = filename.rsplit('.').next() {
+        match ext.to_lowercase().as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "pdf" => "application/pdf",
+            "txt" => "text/plain",
+            "html" | "htm" => "text/html",
+            "css" => "text/css",
+            "js" => "application/javascript",
+            "json" => "application/json",
+            "xml" => "application/xml",
+            "zip" => "application/zip",
+            "rar" => "application/vnd.rar",
+            "tar" => "application/x-tar",
+            "gz" => "application/gzip",
+            "mp3" => "audio/mpeg",
+            "mp4" => "video/mp4",
+            "wav" => "audio/wav",
+            "ogg" => "audio/ogg",
+            "webm" => "video/webm",
+            "doc" | "docx" => "application/msword",
+            "xls" | "xlsx" => "application/vnd.ms-excel",
+            "ppt" | "pptx" => "application/vnd.ms-powerpoint",
+            _ => "application/octet-stream",
+        }
+    } else {
+        "application/octet-stream"
+    }
 }
 
 #[cfg(test)]

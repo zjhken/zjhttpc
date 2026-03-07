@@ -22,7 +22,8 @@ use std::{
 };
 
 use crate::{
-    misc::{Body, TrustStorePem},
+    body::Body,
+    misc::TrustStorePem,
     proxy::{HttpsProxyOption, ProxyConnector, PROXY_TCP_POOL, PROXY_TLS_POOL},
     requestx::Request,
     response::Response,
@@ -389,7 +390,129 @@ where
         Body::Bytes(bytes) => {
             stream_to_write.write_all(&bytes).await.dot()?;
         }
-        Body::Form => unimplemented!(),
+        Body::MultipartForm(form) => {
+            // Serialize multipart form data
+            let boundary = form.boundary().to_string();
+            let boundary_bytes = boundary.as_bytes();
+
+            // Take ownership of fields to consume them
+            let fields = std::mem::take(&mut form.fields);
+
+            for field in fields {
+                // Write boundary
+                stream_to_write.write_all(b"--").await.dot()?;
+                stream_to_write.write_all(boundary_bytes).await.dot()?;
+                stream_to_write.write_all(b"\r\n").await.dot()?;
+
+                match field {
+                    crate::body::MultipartField::Text(name, value) => {
+                        stream_to_write
+                            .write_all(format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes())
+                            .await.dot()?;
+                        stream_to_write.write_all(value.as_bytes()).await.dot()?;
+                        stream_to_write.write_all(b"\r\n").await.dot()?;
+                    }
+                    crate::body::MultipartField::FilePath(name, path, filename_opt, content_type_opt) => {
+                        let filename = filename_opt.as_ref()
+                            .map(|f| f.as_str())
+                            .unwrap_or_else(|| {
+                                path.file_name().and_then(|n| n.to_str()).unwrap_or("filename")
+                            });
+                        let content_type = content_type_opt.as_ref()
+                            .map(|c| c.as_str())
+                            .unwrap_or_else(|| {
+                                crate::body::detect_mime_type(filename)
+                            });
+
+                        stream_to_write
+                            .write_all(format!(
+                                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                                name, filename
+                            ).as_bytes())
+                            .await.dot()?;
+                        stream_to_write
+                            .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
+                            .await.dot()?;
+
+                        // Read and write file content
+                        let mut file = async_std::fs::File::open(path).await.dot()?;
+                        let mut buf = vec![0u8; 1024 * 64]; // 64KB buffer
+                        loop {
+                            let n = file.read(&mut buf).await.dot()?;
+                            if n == 0 {
+                                break;
+                            }
+                            stream_to_write.write_all(&buf[..n]).await.dot()?;
+                        }
+                        stream_to_write.write_all(b"\r\n").await.dot()?;
+                    }
+                    crate::body::MultipartField::File(name, file, filename_opt, content_type_opt) => {
+                        let filename = filename_opt.as_ref().map(|f| f.as_str()).unwrap_or("filename");
+                        let content_type = content_type_opt.as_ref()
+                            .map(|c| c.as_str())
+                            .unwrap_or_else(|| {
+                                crate::body::detect_mime_type(filename)
+                            });
+
+                        stream_to_write
+                            .write_all(format!(
+                                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                                name, filename
+                            ).as_bytes())
+                            .await.dot()?;
+                        stream_to_write
+                            .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
+                            .await.dot()?;
+
+                        // Read and write file content
+                        let mut file = file;
+                        let mut buf = vec![0u8; 1024 * 64]; // 64KB buffer
+                        loop {
+                            let n = file.read(&mut buf).await.dot()?;
+                            if n == 0 {
+                                break;
+                            }
+                            stream_to_write.write_all(&buf[..n]).await.dot()?;
+                        }
+                        stream_to_write.write_all(b"\r\n").await.dot()?;
+                    }
+                    crate::body::MultipartField::Stream(name, mut stream, filename_opt, content_type_opt) => {
+                        let filename = filename_opt.as_ref().map(|f| f.as_str()).unwrap_or("filename");
+                        let content_type = content_type_opt.as_ref()
+                            .map(|c| c.as_str())
+                            .unwrap_or_else(|| {
+                                crate::body::detect_mime_type(filename)
+                            });
+
+                        stream_to_write
+                            .write_all(format!(
+                                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                                name, filename
+                            ).as_bytes())
+                            .await.dot()?;
+                        stream_to_write
+                            .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
+                            .await.dot()?;
+
+                        // Read and write stream content
+                        let mut buf = vec![0u8; 1024 * 64]; // 64KB buffer
+                        loop {
+                            let n = stream.read(&mut buf).await.dot()?;
+                            if n == 0 {
+                                break;
+                            }
+                            stream_to_write.write_all(&buf[..n]).await.dot()?;
+                        }
+                        stream_to_write.write_all(b"\r\n").await.dot()?;
+                    }
+                }
+            }
+
+            // Write final boundary
+            stream_to_write.write_all(b"--").await.dot()?;
+            stream_to_write.write_all(boundary_bytes).await.dot()?;
+            stream_to_write.write_all(b"--\r\n").await.dot()?;
+        }
     }
     Ok(())
 }
