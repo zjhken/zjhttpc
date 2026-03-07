@@ -610,7 +610,7 @@ pub fn return_stream_to_pool(stream: BoxedStream, stream_info: StreamInfo) {
 /// The preferred approach for new code is to use return_stream_to_pool directly.
 pub fn return_stream_to_pool_from_response(resp: &mut Response) {
     // Only return to pool if body was successfully read
-    if !resp.body_successfully_readed {
+    if !resp.is_body_read_complete() {
         // TODO: for now just close the connection
         // in the future we can try to drain it with timeout
         // but during the data reading, we have to consider the content-length and transfer-encoding

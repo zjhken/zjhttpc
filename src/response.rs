@@ -8,13 +8,16 @@ use std::{net::SocketAddr, vec};
 use tracing::error;
 
 use crate::{
-    client::{read_until_v, return_stream_to_pool, return_stream_to_pool_from_response},
+    client::{read_until_v, return_stream_to_pool},
     error::ZjhttpcError,
     misc::HttpVersion,
     proxy::HttpsProxyOption,
     stream::BoxedStream,
 };
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// A streaming chunked decoder that processes chunks on-the-fly without buffering the entire body
 pub struct ChunkedDecoderStream {
@@ -78,7 +81,13 @@ impl ChunkedDecoderStream {
         }
     }
 
-    pub fn new_with_completion_flag(inner: BoxedStream, completion_flag: Arc<AtomicBool>, addr: SocketAddr, is_tls: bool, proxy_used: Option<HttpsProxyOption>) -> Self {
+    pub fn new_with_completion_flag(
+        inner: BoxedStream,
+        completion_flag: Arc<AtomicBool>,
+        addr: SocketAddr,
+        is_tls: bool,
+        proxy_used: Option<HttpsProxyOption>,
+    ) -> Self {
         Self {
             inner: Some(inner),
             state: DecoderState::ReadingChunkSize,
@@ -111,8 +120,11 @@ impl ChunkedDecoderStream {
     /// Try to read the next chunk size. Returns Ok(true) if a new chunk size was read,
     /// Ok(false) if the final chunk (size 0) was reached, or Err if there was an error.
     async fn read_chunk_size(&mut self) -> Result<bool> {
-        let inner_stream = self.inner.as_mut().ok_or_else(|| anyhow!("stream is None"))?;
-        
+        let inner_stream = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| anyhow!("stream is None"))?;
+
         self.line_buffer.clear();
         let n = read_until_v(inner_stream, b"\r\n", &mut self.line_buffer).await?;
 
@@ -151,8 +163,11 @@ impl ChunkedDecoderStream {
 
     /// Read chunk trailer (the \r\n after chunk data)
     async fn read_chunk_trailer(&mut self) -> Result<()> {
-        let inner_stream = self.inner.as_mut().ok_or_else(|| anyhow!("stream is None"))?;
-        
+        let inner_stream = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| anyhow!("stream is None"))?;
+
         self.trailer_buffer.clear();
         let n = read_until_v(inner_stream, b"\r\n", &mut self.trailer_buffer).await?;
         if n != 2 {
@@ -247,7 +262,9 @@ impl async_std::io::Read for ChunkedDecoderStream {
 
                                 return std::task::Poll::Ready(Ok(n));
                             }
-                            std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                            std::task::Poll::Ready(Err(e)) => {
+                                return std::task::Poll::Ready(Err(e));
+                            }
                             std::task::Poll::Pending => return std::task::Poll::Pending,
                         }
                     } else {
@@ -301,7 +318,14 @@ impl BodyFixedLengthStream {
         }
     }
 
-    pub fn new_with_completion_flag(inner: BoxedStream, content_length: usize, completion_flag: Arc<AtomicBool>, addr: SocketAddr, is_tls: bool, proxy_used: Option<HttpsProxyOption>) -> Self {
+    pub fn new_with_completion_flag(
+        inner: BoxedStream,
+        content_length: usize,
+        completion_flag: Arc<AtomicBool>,
+        addr: SocketAddr,
+        is_tls: bool,
+        proxy_used: Option<HttpsProxyOption>,
+    ) -> Self {
         Self {
             inner: Some(inner),
             remaining: content_length,
@@ -403,7 +427,13 @@ impl async_std::io::Write for BodyFixedLengthStream {
 }
 
 impl BodyUnknownLengthStream {
-    pub fn new_with_completion_flag(inner: BoxedStream, completion_flag: Arc<AtomicBool>, addr: SocketAddr, is_tls: bool, proxy_used: Option<HttpsProxyOption>) -> Self {
+    pub fn new_with_completion_flag(
+        inner: BoxedStream,
+        completion_flag: Arc<AtomicBool>,
+        addr: SocketAddr,
+        is_tls: bool,
+        proxy_used: Option<HttpsProxyOption>,
+    ) -> Self {
         Self {
             inner: Some(inner),
             completion_flag,
@@ -448,9 +478,7 @@ impl async_std::io::Read for BodyUnknownLengthStream {
                     self.return_stream_to_pool();
                     std::task::Poll::Ready(Ok(0))
                 }
-                std::task::Poll::Ready(Ok(n)) => {
-                    std::task::Poll::Ready(Ok(n))
-                }
+                std::task::Poll::Ready(Ok(n)) => std::task::Poll::Ready(Ok(n)),
                 std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
                 std::task::Poll::Pending => std::task::Poll::Pending,
             }
@@ -499,21 +527,39 @@ impl crate::stream::RWStream for BodyUnknownLengthStream {}
 pub struct Response {
     pub addr: SocketAddr,
     pub is_tls: bool,
-    pub body_successfully_readed: bool,
     pub http_version: HttpVersion,
     pub status_code: u16,
     pub headers: HashMap<String, IndexSet<String>>,
-    /// If you use this raw stream directly, remember to set body_successfully_readed to true when done
+    /// If you use this raw stream directly, call mark_body_read_complete() when done
     /// If you use body_managed_stream() instead, the returned wrapper handles this automatically
     pub body_raw_stream: Option<BoxedStream>,
     pub proxy_used: Option<HttpsProxyOption>,
+    /// Track if the response body has been fully consumed
+    /// This is used to determine if the connection should be returned to pool on Drop
+    /// - For managed streams: wrapper sets this to true when fully consumed
+    /// - For raw streams: user should call mark_body_read_complete() when done
+    body_completion_flag: Arc<AtomicBool>,
 }
 
 impl Drop for Response {
     fn drop(&mut self) {
-        // Only return to pool if body was not consumed through managed stream
-        if !self.body_successfully_readed {
-            return_stream_to_pool_from_response(self)
+        // Check if body was fully consumed
+        if self.body_completion_flag.load(Ordering::Relaxed) {
+            // Body was fully consumed
+            // If body_raw_stream is still present (user used raw_stream + mark_complete), return to pool
+            if let Some(stream) = self.body_raw_stream.take() {
+                let stream_info = crate::client::StreamInfo {
+                    addr: self.addr,
+                    is_tls: self.is_tls,
+                    proxy_used: self.proxy_used.clone(),
+                };
+                return_stream_to_pool(stream, stream_info);
+            }
+            // If body_raw_stream is None, managed stream already returned it
+        } else {
+            // Body was NOT fully consumed
+            // Do NOT return to pool to avoid contamination
+            // The connection will be closed when the stream is dropped
         }
     }
 }
@@ -551,13 +597,13 @@ impl Response {
         }
         let resp = Response {
             is_tls,
-            body_successfully_readed: false,
             http_version,
             status_code,
             headers,
             body_raw_stream: Some(stream),
             addr,
             proxy_used,
+            body_completion_flag: Arc::new(AtomicBool::new(false)),
         };
         return Ok(resp);
     }
@@ -585,7 +631,7 @@ impl Response {
     }
 
     pub async fn body_string(&mut self) -> Result<String> {
-        if self.body_successfully_readed {
+        if self.is_body_read_complete() {
             return Err(anyhow!("response body has been read"));
         }
 
@@ -633,7 +679,7 @@ impl Response {
     /// - Once you use this stream, you become responsible for reading it completely.
     /// - If you don't read the stream completely, the connection may not be reusable.
     pub fn body_managed_stream(&mut self) -> Option<BoxedStream> {
-        if self.body_successfully_readed {
+        if self.is_body_read_complete() {
             return None;
         }
 
@@ -648,40 +694,35 @@ impl Response {
         let content_length = self.content_length();
 
         if let Some(stream) = self.body_raw_stream.take() {
-            self.body_successfully_readed = true;
-
             if is_chunked {
                 // For chunked encoding, wrap the stream with our decoder
-                let completion_flag = Arc::new(AtomicBool::new(false));
                 let decoder = ChunkedDecoderStream::new_with_completion_flag(
-                    stream, 
-                    completion_flag, 
-                    self.addr, 
-                    self.is_tls, 
-                    self.proxy_used.clone()
+                    stream,
+                    self.body_completion_flag.clone(),
+                    self.addr,
+                    self.is_tls,
+                    self.proxy_used.clone(),
                 );
                 Some(Box::new(decoder))
             } else if let Some(length) = content_length {
                 // For responses with Content-Length, use BodyFixedLengthStream
-                let completion_flag = Arc::new(AtomicBool::new(false));
                 let fixed_length_stream = BodyFixedLengthStream::new_with_completion_flag(
-                    stream, 
-                    length as usize, 
-                    completion_flag,
+                    stream,
+                    length as usize,
+                    self.body_completion_flag.clone(),
                     self.addr,
                     self.is_tls,
-                    self.proxy_used.clone()
+                    self.proxy_used.clone(),
                 );
                 Some(Box::new(fixed_length_stream))
             } else {
                 // For other responses, wrap with BodyUnknownLengthStream for completion tracking
-                let completion_flag = Arc::new(AtomicBool::new(false));
                 let unknown_length_stream = BodyUnknownLengthStream::new_with_completion_flag(
                     stream,
-                    completion_flag,
+                    self.body_completion_flag.clone(),
                     self.addr,
                     self.is_tls,
-                    self.proxy_used.clone()
+                    self.proxy_used.clone(),
                 );
                 Some(Box::new(unknown_length_stream))
             }
@@ -691,18 +732,20 @@ impl Response {
     }
 
     /// Read the entire body and return it as bytes
-    /// 
+    ///
     /// This method consumes the response body and reads all data into memory.
     /// For large bodies, consider using body_managed_stream() for streaming access.
     pub async fn body_bytes(&mut self) -> Result<Vec<u8>> {
-        if self.body_successfully_readed {
+        if self.is_body_read_complete() {
             return Err(anyhow!("response body has been read"));
         }
 
         if let Some(mut stream) = self.body_managed_stream() {
             let mut bytes: Vec<u8> = Vec::new();
             let mut buf = [0u8; 8192]; // 8KB buffer
-            while let n = stream.read(&mut buf).await.dot()? && n > 0 {
+            while let n = stream.read(&mut buf).await.dot()?
+                && n > 0
+            {
                 bytes.extend_from_slice(&buf[..n]);
             }
             Ok(bytes)
@@ -722,6 +765,46 @@ impl Response {
             .get("content-length")
             .and_then(|vec| vec.first())
             .and_then(|s| s.parse::<u64>().ok())
+    }
+
+    /// Mark the response body as successfully read.
+    ///
+    /// This method should be called when you have finished reading the body through
+    /// `body_raw_stream` directly. It ensures the connection can be returned to the pool
+    /// for reuse.
+    ///
+    /// # When to use this
+    ///
+    /// - **Use this** when you read from `body_raw_stream` directly
+    /// - **Don't use this** when you use `body_managed_stream()`, `body_bytes()`, or `body_string()` -
+    ///   they handle completion tracking automatically
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let mut resp = client.send(&mut req).await?;
+    /// if let Some(mut stream) = resp.body_raw_stream.take() {
+    ///     // Read data...
+    ///     let mut buf = [0u8; 1024];
+    ///     while let Ok(n) = stream.read(&mut buf).await {
+    ///         if n == 0 { break; }
+    ///         // Process data...
+    ///     }
+    ///     // Mark as complete so connection can be reused
+    ///     resp.mark_body_read_complete();
+    /// }
+    /// ```
+    pub fn mark_body_read_complete(&mut self) {
+        self.body_completion_flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Check if the response body has been successfully read.
+    ///
+    /// Returns `true` if:
+    /// - The body was read via `body_managed_stream()` and fully consumed, OR
+    /// - The body was read via `body_raw_stream` and `mark_body_read_complete()` was called
+    pub fn is_body_read_complete(&self) -> bool {
+        self.body_completion_flag.load(Ordering::Relaxed)
     }
 }
 
@@ -1014,7 +1097,7 @@ mod tests {
         // Read all data
         let mut buffer = Vec::new();
         let result = async_std::task::block_on(decoder.read_to_end(&mut buffer));
-        
+
         assert!(result.is_ok());
         assert_eq!(buffer, b"Hello World");
         assert!(decoder.is_fully_consumed());
@@ -1105,7 +1188,7 @@ mod tests {
         // Read all data
         let mut buffer = Vec::new();
         let result = async_std::task::block_on(unknown_stream.read_to_end(&mut buffer));
-        
+
         assert!(result.is_ok());
         assert_eq!(buffer, data);
         assert!(unknown_stream.is_fully_consumed());
@@ -1183,15 +1266,15 @@ mod tests {
 
     #[test]
     fn test_body_stream_completion_flag_behavior() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         // Test completion flag behavior
         let completion_flag = Arc::new(AtomicBool::new(false));
-        
+
         // Initially should be false
         assert!(!completion_flag.load(Ordering::Relaxed));
-        
+
         // Set to true
         completion_flag.store(true, Ordering::Relaxed);
         assert!(completion_flag.load(Ordering::Relaxed));
@@ -1206,21 +1289,77 @@ mod tests {
         let response = Response {
             addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
             is_tls: false,
-            body_successfully_readed: false,
             http_version: HttpVersion::V1_1,
             status_code: 200,
             headers: HashMap::new(),
             body_raw_stream: None,
             proxy_used: None,
+            body_completion_flag: Arc::new(AtomicBool::new(false)),
         };
 
         // Test initial state
-        assert!(!response.body_successfully_readed);
+        assert!(!response.is_body_read_complete());
         assert_eq!(response.status_code(), 200);
         assert!(response.is_success());
     }
 
-  
+    #[test]
+    fn test_mark_body_read_complete() {
+        use hashbrown::HashMap;
+        use std::net::SocketAddr;
+
+        // Create a mock response with raw_stream
+        let mut response = Response {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            is_tls: false,
+            http_version: HttpVersion::V1_1,
+            status_code: 200,
+            headers: HashMap::new(),
+            body_raw_stream: None,
+            proxy_used: None,
+            body_completion_flag: Arc::new(AtomicBool::new(false)),
+        };
+
+        // Initially not complete
+        assert!(!response.is_body_read_complete());
+
+        // Mark as complete
+        response.mark_body_read_complete();
+
+        // Now should be complete
+        assert!(response.is_body_read_complete());
+    }
+
+    #[test]
+    fn test_completion_flag_with_managed_stream() {
+        use hashbrown::HashMap;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Test that the same completion_flag is shared between Response and wrapper
+        let completion_flag = Arc::new(AtomicBool::new(false));
+        let response = Response {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            is_tls: false,
+            http_version: HttpVersion::V1_1,
+            status_code: 200,
+            headers: HashMap::new(),
+            body_raw_stream: None,
+            proxy_used: None,
+            body_completion_flag: completion_flag.clone(),
+        };
+
+        // Initially not complete
+        assert!(!response.is_body_read_complete());
+
+        // Simulate managed stream completing (wrapper sets flag to true)
+        response.body_completion_flag.store(true, Ordering::Relaxed);
+
+        // Response should see the change
+        assert!(response.is_body_read_complete());
+    }
+
     #[test]
     fn test_body_fixed_length_stream_zero_length() {
         use async_std::io::ReadExt;
@@ -1293,7 +1432,7 @@ mod tests {
         // Test that reading returns 0 immediately
         let mut buffer = [0u8; 10];
         let result = async_std::task::block_on(fixed_stream.read(&mut buffer));
-        
+
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
         assert!(fixed_stream.is_fully_consumed());
@@ -1380,12 +1519,12 @@ mod tests {
         let mut response = Response {
             addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             is_tls: false,
-            body_successfully_readed: false,
             http_version: HttpVersion::V1_1,
             status_code: 200,
             headers,
             body_raw_stream: Some(boxed_stream),
             proxy_used: None,
+            body_completion_flag: Arc::new(AtomicBool::new(false)),
         };
 
         // Test body_bytes method
@@ -1476,19 +1615,19 @@ mod tests {
         let mut response = Response {
             addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             is_tls: false,
-            body_successfully_readed: false,
             http_version: HttpVersion::V1_1,
             status_code: 200,
             headers,
             body_raw_stream: Some(boxed_stream),
             proxy_used: None,
+            body_completion_flag: Arc::new(AtomicBool::new(false)),
         };
 
         // Test body_json method
         let result = async_std::task::block_on(response.body_json());
         assert!(result.is_ok());
         let json_value = result.unwrap();
-        
+
         // Verify JSON parsing
         assert_eq!(json_value["name"], "test");
         assert_eq!(json_value["value"], 42);
@@ -1570,12 +1709,12 @@ mod tests {
         let mut response = Response {
             addr: std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             is_tls: false,
-            body_successfully_readed: false,
             http_version: HttpVersion::V1_1,
             status_code: 200,
             headers: hashbrown::HashMap::new(),
             body_raw_stream: Some(boxed_stream),
             proxy_used: None,
+            body_completion_flag: Arc::new(AtomicBool::new(false)),
         };
 
         // Test body_json method with invalid JSON
