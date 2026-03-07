@@ -539,6 +539,8 @@ pub struct Response {
     /// - For managed streams: wrapper sets this to true when fully consumed
     /// - For raw streams: user should call mark_body_read_complete() when done
     body_completion_flag: Arc<AtomicBool>,
+    /// Timeout for reading response body
+    pub read_body_timeout: Option<std::time::Duration>,
 }
 
 impl Drop for Response {
@@ -573,6 +575,7 @@ impl Response {
         is_tls: bool,
         addr: SocketAddr,
         proxy_used: Option<HttpsProxyOption>,
+        read_body_timeout: Option<std::time::Duration>,
     ) -> Result<Self, ZjhttpcError> {
         let http_version = match http_version {
             "1.1" => HttpVersion::V1_1,
@@ -604,6 +607,7 @@ impl Response {
             addr,
             proxy_used,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
+            read_body_timeout,
         };
         return Ok(resp);
     }
@@ -638,11 +642,25 @@ impl Response {
         if let Some(mut stream) = self.body_managed_stream() {
             let mut bytes: Vec<u8> = Vec::new();
             let mut buf = [0u8; 1024];
-            while let n = stream.read(&mut buf).await.dot()?
-                && n > 0
-            {
-                bytes.extend_from_slice(&buf[..n]);
+
+            // Apply read body timeout if set
+            let read_future = async {
+                while let n = stream.read(&mut buf).await.dot()?
+                    && n > 0
+                {
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+
+            if let Some(timeout) = self.read_body_timeout {
+                async_std::future::timeout(timeout, read_future)
+                    .await
+                    .map_err(|_| anyhow!("read body timeout after {:?}", timeout))??;
+            } else {
+                read_future.await?;
             }
+
             // considering the encoding
             if let Some(x) = self.headers.get("content-type")
                 && x.last()
@@ -743,11 +761,25 @@ impl Response {
         if let Some(mut stream) = self.body_managed_stream() {
             let mut bytes: Vec<u8> = Vec::new();
             let mut buf = [0u8; 8192]; // 8KB buffer
-            while let n = stream.read(&mut buf).await.dot()?
-                && n > 0
-            {
-                bytes.extend_from_slice(&buf[..n]);
+
+            // Apply read body timeout if set
+            let read_future = async {
+                while let n = stream.read(&mut buf).await.dot()?
+                    && n > 0
+                {
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+
+            if let Some(timeout) = self.read_body_timeout {
+                async_std::future::timeout(timeout, read_future)
+                    .await
+                    .map_err(|_| anyhow!("read body timeout after {:?}", timeout))??;
+            } else {
+                read_future.await?;
             }
+
             Ok(bytes)
         } else {
             Ok(Vec::new())
@@ -824,6 +856,7 @@ mod tests {
 
     #[test]
     #[tracing_test::traced_test]
+    #[ignore] // This test requires a local HTTP server running on 127.0.0.1:8888
     fn test_chunked() {
         task::block_on(async {
             // let mut req = Request::new("GET", "http://127.0.0.1:8888/test/chunk").unwrap();
@@ -1295,6 +1328,7 @@ mod tests {
             body_raw_stream: None,
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
+            read_body_timeout: None,
         };
 
         // Test initial state
@@ -1318,6 +1352,7 @@ mod tests {
             body_raw_stream: None,
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
+            read_body_timeout: None,
         };
 
         // Initially not complete
@@ -1348,6 +1383,7 @@ mod tests {
             body_raw_stream: None,
             proxy_used: None,
             body_completion_flag: completion_flag.clone(),
+            read_body_timeout: None,
         };
 
         // Initially not complete
@@ -1525,6 +1561,7 @@ mod tests {
             body_raw_stream: Some(boxed_stream),
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
+            read_body_timeout: None,
         };
 
         // Test body_bytes method
@@ -1621,6 +1658,7 @@ mod tests {
             body_raw_stream: Some(boxed_stream),
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
+            read_body_timeout: None,
         };
 
         // Test body_json method
@@ -1715,6 +1753,7 @@ mod tests {
             body_raw_stream: Some(boxed_stream),
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
+            read_body_timeout: None,
         };
 
         // Test body_json method with invalid JSON

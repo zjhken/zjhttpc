@@ -23,7 +23,9 @@ pub struct Request {
     pub content_type: &'static str,
     pub basic_auth: Option<(String, String)>,
     pub content_length: u64,
-    pub header_timeout: Option<Duration>,
+    pub send_header_timeout: Option<Duration>,
+    pub read_header_timeout: Option<Duration>,
+    pub read_body_timeout: Option<Duration>,
     pub connect_timeout: Option<Duration>,
     pub body: Body,
     pub trust_store_pem: Option<TrustStorePem>,
@@ -49,7 +51,9 @@ impl Request {
             basic_auth: None,
             body: Body::None,
             content_length: 0,
-            header_timeout: None,
+            send_header_timeout: None,
+            read_header_timeout: None,
+            read_body_timeout: None,
             connect_timeout: None,
             trust_store_pem: None,
             proxy: None,
@@ -250,8 +254,24 @@ impl Request {
         self
     }
 
+    pub fn set_send_header_timeout(mut self, dur: Duration) -> Self {
+        self.send_header_timeout = Some(dur);
+        self
+    }
+
+    pub fn set_read_header_timeout(mut self, dur: Duration) -> Self {
+        self.read_header_timeout = Some(dur);
+        self
+    }
+
+    pub fn set_read_body_timeout(mut self, dur: Duration) -> Self {
+        self.read_body_timeout = Some(dur);
+        self
+    }
+
+    /// Deprecated: Use set_read_header_timeout instead
     pub fn set_header_timeout(mut self, dur: Duration) -> Self {
-        self.header_timeout = Some(dur);
+        self.read_header_timeout = Some(dur);
         self
     }
 

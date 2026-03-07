@@ -50,8 +50,9 @@ pub struct StreamInfo {
 #[builder(setter(strip_option))]
 pub struct ZJHttpClient {
     // connection_pool: unimplemented!(),
-    pub global_total_timeout: Duration,
-    pub global_header_timeout: Duration,
+    pub global_send_header_timeout: Duration,
+    pub global_read_header_timeout: Duration,
+    pub global_read_body_timeout: Option<Duration>,
     pub global_connect_timeout: Duration,
     pub global_trust_store_pem: Option<TrustStorePem>,
     pub global_proxy: Option<HttpsProxyOption>,
@@ -61,8 +62,9 @@ impl ZJHttpClient {
     #[must_use]
     pub fn new() -> ZJHttpClient {
         ZJHttpClient {
-            global_total_timeout: Duration::from_secs(300),
-            global_header_timeout: Duration::from_secs(30),
+            global_send_header_timeout: Duration::from_secs(30),
+            global_read_header_timeout: Duration::from_secs(30),
+            global_read_body_timeout: None,
             global_connect_timeout: Duration::from_secs(3),
             global_trust_store_pem: None,
             global_proxy: None,
@@ -88,16 +90,16 @@ impl ZJHttpClient {
     pub async fn send(&self, req: &mut Request) -> Result<Response> {
         let addr = resolve_1st_ip(req).await.dot()?;
         let mut stream: BoxedStream = pick_or_connect_stream(self, &req, &addr).await.dot()?;
-        send_header(req, &mut stream).await.dot()?;
+        send_header(self, req, &mut stream).await.dot()?;
         send_body(req, &mut stream).await.dot()?;
         let resp = read_headers_to_resp(self, req, stream, addr).await.dot()?;
-        return Ok(resp);
+        Ok(resp)
     }
 
     pub async fn send_header_only(&self, req: &mut Request) -> Result<(BoxedStream, SocketAddr)> {
         let addr = resolve_1st_ip(req).await.dot()?;
         let mut stream: BoxedStream = pick_or_connect_stream(self, &req, &addr).await.dot()?;
-        send_header(req, &mut stream).await.dot()?;
+        send_header(self, req, &mut stream).await.dot()?;
         return Ok((stream, addr));
     }
 
@@ -293,71 +295,80 @@ pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::
     return Ok(client_config);
 }
 
-async fn send_header<S>(req: &Request, stream: &mut S) -> Result<()>
+async fn send_header<S>(client: &ZJHttpClient, req: &Request, stream: &mut S) -> Result<()>
 where
     S: async_std::io::Read + async_std::io::Write + Unpin + Send + Sync + 'static,
 {
-    stream.write_all(req.method.as_bytes()).await.dot()?;
-    stream.write_all(b" ").await.dot()?;
-    let path = req.url.path();
-    stream.write_all(path.as_bytes()).await.dot()?;
-    if let Some(q) = req.url.query() {
-        stream.write_all(b"?").await.dot()?;
-        stream.write_all(q.as_bytes()).await.dot()?;
-    }
-    // TODO: maybe need to handle segements like "#a=b"
-    stream.write_all(b" ").await.dot()?;
-    stream.write_all(b"HTTP/1.1\r\n").await.dot()?;
-    // insert headers
-    for (key, values) in &req.headers {
-        stream.write_all(key.as_bytes()).await.dot()?;
-        stream.write_all(b": ").await.dot()?;
-        // TODO: handle multi same key headers
+    // Apply send header timeout
+    let timeout_dur = req.send_header_timeout.unwrap_or(client.global_send_header_timeout);
+    let send_future = async {
+        stream.write_all(req.method.as_bytes()).await.dot()?;
+        stream.write_all(b" ").await.dot()?;
+        let path = req.url.path();
+        stream.write_all(path.as_bytes()).await.dot()?;
+        if let Some(q) = req.url.query() {
+            stream.write_all(b"?").await.dot()?;
+            stream.write_all(q.as_bytes()).await.dot()?;
+        }
+        // TODO: maybe need to handle segements like "#a=b"
+        stream.write_all(b" ").await.dot()?;
+        stream.write_all(b"HTTP/1.1\r\n").await.dot()?;
+        // insert headers
+        for (key, values) in &req.headers {
+            stream.write_all(key.as_bytes()).await.dot()?;
+            stream.write_all(b": ").await.dot()?;
+            // TODO: handle multi same key headers
+            stream
+                .write_all(values.first().unwrap().as_bytes())
+                .await
+                .dot()?;
+            stream.write_all(b"\r\n").await.dot()?;
+        }
+        stream.write_all(b"Content-Length: ").await.dot()?;
         stream
-            .write_all(values.first().unwrap().as_bytes())
+            .write_all(req.content_length.to_string().as_bytes())
             .await
             .dot()?;
         stream.write_all(b"\r\n").await.dot()?;
-    }
-    stream.write_all(b"Content-Length: ").await.dot()?;
-    stream
-        .write_all(req.content_length.to_string().as_bytes())
-        .await
-        .dot()?;
-    stream.write_all(b"\r\n").await.dot()?;
-    if let Some((username, password)) = &req.basic_auth {
-        let encoded = base64_simd::STANDARD.encode_to_string(format!("{username}:{password}"));
-        let s = format!("Authorization: Basic {encoded}\r\n");
-        stream.write_all(s.as_bytes()).await.dot()?;
-    }
-
-    if req.expect_continue {
-        stream.write_all(b"Expect: 100-continue\r\n").await.dot()?;
-    }
-
-    stream
-        .write_all(b"Connection: keep-alive\r\n")
-        .await
-        .dot()?;
-    stream.write_all(b"\r\n").await.dot()?;
-    stream.flush().await.dot()?;
-
-    if req.expect_continue {
-        let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf).await.dot()?;
-        if n == 0 {
-            return Err(anyhow!(
-                "stream closed before read the 100 continue response"
-            ));
+        if let Some((username, password)) = &req.basic_auth {
+            let encoded = base64_simd::STANDARD.encode_to_string(format!("{username}:{password}"));
+            let s = format!("Authorization: Basic {encoded}\r\n");
+            stream.write_all(s.as_bytes()).await.dot()?;
         }
-        let resp = std::str::from_utf8(&buf[0..n])
-            .dot()
-            .context("resp after expect 100 is not utf8")?;
-        if resp != "HTTP/1.1 100 Continue\r\n\r\n" {
-            return Err(anyhow!("received non-100-continue resp={resp}"));
+
+        if req.expect_continue {
+            stream.write_all(b"Expect: 100-continue\r\n").await.dot()?;
         }
+
+        stream
+            .write_all(b"Connection: keep-alive\r\n")
+            .await
+            .dot()?;
+        stream.write_all(b"\r\n").await.dot()?;
+        stream.flush().await.dot()?;
+
+        if req.expect_continue {
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.dot()?;
+            if n == 0 {
+                return Err(anyhow!(
+                    "stream closed before read the 100 continue response"
+                ));
+            }
+            let resp = std::str::from_utf8(&buf[0..n])
+                .dot()
+                .context("resp after expect 100 is not utf8")?;
+            if resp != "HTTP/1.1 100 Continue\r\n\r\n" {
+                return Err(anyhow!("received non-100-continue resp={resp}"));
+            }
+        }
+        Ok(())
+    };
+
+    match future::timeout(timeout_dur, send_future).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("send header timeout after {:?}", timeout_dur)),
     }
-    Ok(())
 }
 
 async fn send_body<S>(req: &mut Request, stream_to_write: &mut S) -> Result<()>
@@ -529,11 +540,8 @@ async fn read_headers_to_resp(
     // Read all headers at once (including status line) until \r\n\r\n
     let all_headers = {
         let fut = read_until(&mut stream, b"\r\n\r\n");
-        if let Some(dur) = req.header_timeout {
-            future::timeout(dur, fut).await.dot()??
-        } else {
-            fut.await.dot()?
-        }
+        let dur = req.read_header_timeout.unwrap_or(client.global_read_header_timeout);
+        future::timeout(dur, fut).await.dot()??
     };
 
     let input = std::str::from_utf8(&all_headers).dot()?;
@@ -555,6 +563,9 @@ async fn read_headers_to_resp(
         .map(|(key, value)| (key.to_ascii_lowercase(), value.to_owned()))
         .collect::<Vec<_>>();
 
+    // Determine read body timeout (request-level takes precedence over client-level)
+    let read_body_timeout = req.read_body_timeout.or(client.global_read_body_timeout);
+
     return Response::new_from_parse_result(
         http_version,
         status_code,
@@ -563,6 +574,7 @@ async fn read_headers_to_resp(
         req.url.scheme() == "https",
         addr,
         proxy_used,
+        read_body_timeout,
     )
     .map_err(|e| anyhow!("{e}"));
 }
