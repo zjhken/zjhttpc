@@ -1,3 +1,4 @@
+pub mod body;
 pub mod error;
 pub mod methods;
 pub mod proxy;

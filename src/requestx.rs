@@ -9,6 +9,7 @@ use futures::io::BufReader;
 use std::time::Duration;
 
 use crate::{
+    body::BodyForm,
     error::ZjhttpcError,
     misc::{Body, TrustStorePem},
     proxy::HttpsProxyOption,
@@ -164,8 +165,44 @@ impl Request {
         self
     }
 
-    pub fn set_body_form(self, _form: HashMap<String, String>) -> Self {
-        unimplemented!();
+    /// Set the request body as application/x-www-form-urlencoded form data.
+    ///
+    /// This method automatically sets the Content-Type header to
+    /// "application/x-www-form-urlencoded", overwriting any previous value.
+    ///
+    /// # Arguments
+    /// * `form` - A BodyForm instance containing the form fields
+    ///
+    /// # Examples
+    /// ```
+    /// use zjhttpc::body::BodyForm;
+    /// use zjhttpc::requestx::Request;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let form = BodyForm::new()
+    ///     .add("username", "alice")
+    ///     .add("password", "secret")
+    ///     .add("tags", "rust")
+    ///     .add("tags", "http");
+    ///
+    /// let request = Request::new("POST", "https://example.com/login")?
+    ///     .set_body_form(form);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn set_body_form(mut self, form: BodyForm) -> Self {
+        // Auto-set Content-Type to application/x-www-form-urlencoded
+        self.content_type = "application/x-www-form-urlencoded";
+
+        // Serialize the form data
+        let serialized = form.serialize();
+
+        // Set the body
+        self.content_length = serialized.len() as u64;
+        self.body = Body::Str(serialized);
+
+        self
     }
 
     pub fn set_body_multipart_form(self, _form: HashMap<String, String>) -> Self {
