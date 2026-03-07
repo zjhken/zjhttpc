@@ -1,4 +1,5 @@
 pub mod body;
+pub mod cookie;
 pub mod error;
 pub mod methods;
 pub mod proxy;

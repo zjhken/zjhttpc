@@ -634,6 +634,29 @@ impl Response {
             .unwrap_or_default()
     }
 
+    /// Read cookies from Set-Cookie headers
+    ///
+    /// # Returns
+    /// Vec of cookies parsed from all Set-Cookie headers
+    ///
+    /// # Examples
+    /// ```
+    /// use zjhttpc::response::Response;
+    /// use zjhttpc::cookie::Cookie;
+    ///
+    /// // Assuming you have a Response instance
+    /// let cookies = response.read_cookies();
+    /// for cookie in cookies {
+    ///     println!("Cookie: {}={}", cookie.name, cookie.value);
+    /// }
+    /// ```
+    pub fn read_cookies(&self) -> Vec<crate::cookie::Cookie> {
+        self.header_all(crate::header::SET_COOKIE)
+            .iter()
+            .flat_map(|&value| crate::cookie::Cookie::parse_from_set_cookie(std::iter::once(value)))
+            .collect()
+    }
+
     pub async fn body_string(&mut self) -> Result<String> {
         if self.is_body_read_complete() {
             return Err(anyhow!("response body has been read"));

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::{
     body::{Body, BodyForm, BodyMultipartForm},
+    cookie::Cookie,
     error::ZjhttpcError,
     misc::TrustStorePem,
     proxy::HttpsProxyOption,
@@ -95,6 +96,34 @@ impl Request {
                 .into_iter()
                 .map(|(k, v)| (k, IndexSet::from([v]))),
         );
+        self
+    }
+
+    /// Set cookies for the request
+    ///
+    /// # Arguments
+    /// * `cookies` - Slice of cookies to set
+    ///
+    /// # Examples
+    /// ```
+    /// use zjhttpc::requestx::Request;
+    /// use zjhttpc::cookie::Cookie;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let cookies = vec![
+    ///     Cookie::new("sessionid", "abc123"),
+    ///     Cookie::new("userdata", "eyJ1c2VyIjoiYWxpY2UifQ=="),
+    /// ];
+    ///
+    /// let request = Request::new("GET", "https://example.com/dashboard")?
+    ///     .set_cookie(&cookies);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_cookie(mut self, cookies: &[Cookie]) -> Self {
+        let cookie_header = Cookie::format_for_request_cookie_header(cookies);
+        self.headers
+            .insert(crate::header::COOKIE.to_owned(), IndexSet::from([cookie_header]));
         self
     }
 
