@@ -3,12 +3,12 @@ use async_std::io::ReadExt;
 use encoding_rs::GBK;
 use hashbrown::HashMap;
 use indexmap::IndexSet;
-use std::{net::SocketAddr, vec};
+use std::net::SocketAddr;
 
 use tracing::error;
 
 use crate::{
-    client::{read_until_v, return_stream_to_pool},
+    client::return_stream_to_pool,
     error::ZjhttpcError,
     misc::HttpVersion,
     proxy::HttpsProxyOption,
@@ -60,9 +60,10 @@ pub struct BodyUnknownLengthStream {
 
 #[derive(Debug, Clone, PartialEq)]
 enum DecoderState {
-    ReadingChunkSize,
+    ReadingChunkSizeLine,
     ReadingChunkData,
-    ReadingChunkTrailer,
+    ReadingChunkTrailerLine,
+    ReadingFinalTrailerLine,
     Complete,
 }
 
@@ -70,7 +71,7 @@ impl ChunkedDecoderStream {
     pub fn new(inner: BoxedStream) -> Self {
         Self {
             inner: Some(inner),
-            state: DecoderState::ReadingChunkSize,
+            state: DecoderState::ReadingChunkSizeLine,
             chunk_remaining: 0,
             line_buffer: Vec::new(),
             trailer_buffer: Vec::new(),
@@ -90,7 +91,7 @@ impl ChunkedDecoderStream {
     ) -> Self {
         Self {
             inner: Some(inner),
-            state: DecoderState::ReadingChunkSize,
+            state: DecoderState::ReadingChunkSizeLine,
             chunk_remaining: 0,
             line_buffer: Vec::new(),
             trailer_buffer: Vec::new(),
@@ -117,67 +118,6 @@ impl ChunkedDecoderStream {
         }
     }
 
-    /// Try to read the next chunk size. Returns Ok(true) if a new chunk size was read,
-    /// Ok(false) if the final chunk (size 0) was reached, or Err if there was an error.
-    async fn read_chunk_size(&mut self) -> Result<bool> {
-        let inner_stream = self
-            .inner
-            .as_mut()
-            .ok_or_else(|| anyhow!("stream is None"))?;
-
-        self.line_buffer.clear();
-        let n = read_until_v(inner_stream, b"\r\n", &mut self.line_buffer).await?;
-
-        let mut chunk_size_str = String::from_utf8_lossy(&self.line_buffer[..n]);
-        // Sometimes there will be \r\n in the beginning instead of the number
-        if chunk_size_str.trim().is_empty() {
-            self.line_buffer.clear();
-            let n = read_until_v(inner_stream, b"\r\n", &mut self.line_buffer).await?;
-            chunk_size_str = String::from_utf8_lossy(&self.line_buffer[..n]);
-        }
-
-        let chunk_size = usize::from_str_radix(chunk_size_str.trim(), 16).map_err(|e| {
-            anyhow!(
-                "invalid chunk size '{:?}': {}",
-                chunk_size_str.as_bytes(),
-                e
-            )
-        })?;
-
-        if chunk_size == 0 {
-            // Read the trailing \r\n after the final chunk size
-            self.line_buffer.clear();
-            let n = read_until_v(inner_stream, b"\r\n", &mut self.line_buffer).await?;
-            if n != 2 {
-                let x = String::from_utf8_lossy(&self.line_buffer[..n]);
-                return Err(anyhow!(
-                    "not possible, it's not \\r\\n after zero in chunk. x={x}, n={n}"
-                ));
-            }
-            return Ok(false); // Final chunk reached
-        }
-
-        self.chunk_remaining = chunk_size;
-        Ok(true) // New chunk size read successfully
-    }
-
-    /// Read chunk trailer (the \r\n after chunk data)
-    async fn read_chunk_trailer(&mut self) -> Result<()> {
-        let inner_stream = self
-            .inner
-            .as_mut()
-            .ok_or_else(|| anyhow!("stream is None"))?;
-
-        self.trailer_buffer.clear();
-        let n = read_until_v(inner_stream, b"\r\n", &mut self.trailer_buffer).await?;
-        if n != 2 {
-            let x = String::from_utf8_lossy(&self.trailer_buffer[..n]);
-            return Err(anyhow!(
-                "not possible, it's not \\r\\n after chunk data. x={x}, n={n}"
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl async_std::io::Read for ChunkedDecoderStream {
@@ -197,58 +137,80 @@ impl async_std::io::Read for ChunkedDecoderStream {
                     self.return_stream_to_pool();
                     return std::task::Poll::Ready(Ok(0));
                 }
-                DecoderState::ReadingChunkSize => {
-                    // Try to read the next chunk size
-                    match async_std::task::block_on(self.read_chunk_size()) {
-                        Ok(true) => {
-                            // Got a new chunk size, switch to reading data
-                            self.state = DecoderState::ReadingChunkData;
-                            continue;
-                        }
-                        Ok(false) => {
-                            // Final chunk reached, we're done
-                            self.state = DecoderState::Complete;
-                            self.completion_flag.store(true, Ordering::Relaxed);
-                            self.return_stream_to_pool();
-                            return std::task::Poll::Ready(Ok(0));
-                        }
-                        Err(e) => {
+                DecoderState::ReadingChunkSizeLine => {
+                    let inner_stream = match &mut self.inner {
+                        Some(s) => s,
+                        None => {
                             return std::task::Poll::Ready(Err(std::io::Error::new(
                                 std::io::ErrorKind::Other,
-                                e,
+                                "stream is None",
                             )));
                         }
-                    }
-                }
-                DecoderState::ReadingChunkTrailer => {
-                    // Read the trailer after chunk data
-                    match async_std::task::block_on(self.read_chunk_trailer()) {
-                        Ok(_) => {
-                            // Trailer read successfully, go back to reading next chunk size
-                            self.state = DecoderState::ReadingChunkSize;
+                    };
+
+                    let mut one_byte = [0u8; 1];
+                    match std::pin::Pin::new(inner_stream).poll_read(cx, &mut one_byte) {
+                        std::task::Poll::Ready(Ok(0)) => {
+                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "unexpected end of stream while reading chunk size",
+                            )));
+                        }
+                        std::task::Poll::Ready(Ok(_)) => {
+                            self.line_buffer.push(one_byte[0]);
+                            if self.line_buffer.ends_with(b"\r\n") {
+                                let line = &self.line_buffer[..self.line_buffer.len() - 2];
+                                let line_str = String::from_utf8_lossy(line);
+
+                                if line_str.trim().is_empty() {
+                                    self.line_buffer.clear();
+                                    continue;
+                                }
+
+                                let chunk_size =
+                                    match usize::from_str_radix(line_str.trim(), 16) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                format!(
+                                                    "invalid chunk size '{:?}': {}",
+                                                    line_str.as_bytes(),
+                                                    e
+                                                ),
+                                            )));
+                                        }
+                                    };
+
+                                self.line_buffer.clear();
+
+                                if chunk_size == 0 {
+                                    self.state = DecoderState::ReadingFinalTrailerLine;
+                                } else {
+                                    self.chunk_remaining = chunk_size;
+                                    self.state = DecoderState::ReadingChunkData;
+                                }
+                                continue;
+                            }
                             continue;
                         }
-                        Err(e) => {
-                            return std::task::Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e,
-                            )));
+                        std::task::Poll::Ready(Err(e)) => {
+                            return std::task::Poll::Ready(Err(e));
                         }
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
                     }
                 }
                 DecoderState::ReadingChunkData => {
-                    // If we have no more data in this chunk, move to trailer reading
                     if self.chunk_remaining == 0 {
-                        self.state = DecoderState::ReadingChunkTrailer;
+                        self.state = DecoderState::ReadingChunkTrailerLine;
                         continue;
                     }
 
-                    // Read data from the current chunk
                     let to_read = std::cmp::min(buf.len(), self.chunk_remaining);
-                    let mut temp_buf = vec![0u8; to_read];
 
                     if let Some(inner_stream) = &mut self.inner {
-                        match std::pin::Pin::new(inner_stream).poll_read(cx, &mut temp_buf) {
+                        match std::pin::Pin::new(inner_stream).poll_read(cx, &mut buf[..to_read])
+                        {
                             std::task::Poll::Ready(Ok(n)) => {
                                 if n == 0 {
                                     return std::task::Poll::Ready(Err(std::io::Error::new(
@@ -257,9 +219,7 @@ impl async_std::io::Read for ChunkedDecoderStream {
                                     )));
                                 }
 
-                                buf[..n].copy_from_slice(&temp_buf[..n]);
                                 self.chunk_remaining -= n;
-
                                 return std::task::Poll::Ready(Ok(n));
                             }
                             std::task::Poll::Ready(Err(e)) => {
@@ -272,6 +232,94 @@ impl async_std::io::Read for ChunkedDecoderStream {
                             std::io::ErrorKind::Other,
                             "stream is None",
                         )));
+                    }
+                }
+                DecoderState::ReadingChunkTrailerLine => {
+                    let inner_stream = match &mut self.inner {
+                        Some(s) => s,
+                        None => {
+                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "stream is None",
+                            )));
+                        }
+                    };
+
+                    let mut one_byte = [0u8; 1];
+                    match std::pin::Pin::new(inner_stream).poll_read(cx, &mut one_byte) {
+                        std::task::Poll::Ready(Ok(0)) => {
+                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "unexpected end of stream while reading chunk trailer",
+                            )));
+                        }
+                        std::task::Poll::Ready(Ok(_)) => {
+                            self.trailer_buffer.push(one_byte[0]);
+                            if self.trailer_buffer.ends_with(b"\r\n") {
+                                if self.trailer_buffer.len() != 2 {
+                                    let x =
+                                        String::from_utf8_lossy(&self.trailer_buffer);
+                                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!(
+                                            "expected \\r\\n after chunk data, got: {x}"
+                                        ),
+                                    )));
+                                }
+                                self.trailer_buffer.clear();
+                                self.state = DecoderState::ReadingChunkSizeLine;
+                                continue;
+                            }
+                            continue;
+                        }
+                        std::task::Poll::Ready(Err(e)) => {
+                            return std::task::Poll::Ready(Err(e));
+                        }
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
+                    }
+                }
+                DecoderState::ReadingFinalTrailerLine => {
+                    let inner_stream = match &mut self.inner {
+                        Some(s) => s,
+                        None => {
+                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "stream is None",
+                            )));
+                        }
+                    };
+
+                    let mut one_byte = [0u8; 1];
+                    match std::pin::Pin::new(inner_stream).poll_read(cx, &mut one_byte) {
+                        std::task::Poll::Ready(Ok(0)) => {
+                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "unexpected end of stream while reading final trailer",
+                            )));
+                        }
+                        std::task::Poll::Ready(Ok(_)) => {
+                            self.trailer_buffer.push(one_byte[0]);
+                            if self.trailer_buffer.ends_with(b"\r\n") {
+                                if self.trailer_buffer.len() != 2 {
+                                    let x =
+                                        String::from_utf8_lossy(&self.trailer_buffer);
+                                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        format!(
+                                            "expected \\r\\n after final chunk, got: {x}"
+                                        ),
+                                    )));
+                                }
+                                self.trailer_buffer.clear();
+                                self.state = DecoderState::Complete;
+                                continue;
+                            }
+                            continue;
+                        }
+                        std::task::Poll::Ready(Err(e)) => {
+                            return std::task::Poll::Ready(Err(e));
+                        }
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
                     }
                 }
             }
