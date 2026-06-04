@@ -6,7 +6,7 @@ use async_std::{
 };
 use rand::seq::IndexedRandom;
 
-use async_tls::{TlsConnector, client::TlsStream};
+use async_tls::TlsConnector;
 use dashmap::DashMap;
 use derive_builder::Builder;
 use nom::{
@@ -29,7 +29,7 @@ use crate::{
     response::Response,
     stream::BoxedStream,
 };
-use tracing::{error, info, trace, warn};
+use tracing::{error, trace};
 
 /// Connection type for pool key
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -117,8 +117,21 @@ impl ZJHttpClient {
 
     pub async fn send(&self, req: &mut Request) -> Result<Response> {
         let addr = resolve_1st_ip(req).await.dot()?;
-        let mut stream: BoxedStream = pick_or_connect_stream(self, &req, &addr).await.dot()?;
-        send_header(self, req, &mut stream).await.dot()?;
+        let (mut stream, reused) = pick_or_connect_stream(self, &req, &addr).await.dot()?;
+
+        // If send_header fails on a reused (pooled) connection, it's likely stale.
+        // Retry once with a fresh connection — body hasn't been consumed yet, so retry is safe.
+        if let Err(e) = send_header(self, req, &mut stream).await {
+            if reused {
+                trace!("pooled connection failed during send_header, retrying with fresh connection");
+                drop(stream);
+                stream = connect_fresh_stream(self, &req, &addr).await.dot()?;
+                send_header(self, req, &mut stream).await.dot()?;
+            } else {
+                return Err(e);
+            }
+        }
+
         send_body(req, &mut stream).await.dot()?;
         let resp = read_headers_to_resp(self, req, stream, addr).await.dot()?;
         Ok(resp)
@@ -126,7 +139,7 @@ impl ZJHttpClient {
 
     pub async fn send_header_only(&self, req: &mut Request) -> Result<(BoxedStream, SocketAddr)> {
         let addr = resolve_1st_ip(req).await.dot()?;
-        let mut stream: BoxedStream = pick_or_connect_stream(self, &req, &addr).await.dot()?;
+        let (mut stream, _) = pick_or_connect_stream(self, &req, &addr).await.dot()?;
         send_header(self, req, &mut stream).await.dot()?;
         return Ok((stream, addr));
     }
@@ -145,19 +158,17 @@ impl ZJHttpClient {
     }
 }
 
+/// Try to pick a stream from the connection pool, or create a new one.
+/// Returns (stream, true) if reused from pool, (stream, false) if freshly created.
 async fn pick_or_connect_stream(
     client: &ZJHttpClient,
     req: &Request,
     addr: &SocketAddr,
-) -> Result<BoxedStream> {
+) -> Result<(BoxedStream, bool)> {
     // Determine which proxy to use (request-level takes precedence over client-level)
     let proxy = req.proxy.as_ref().or(client.global_proxy.as_ref());
 
-    // Determine connect timeout to use (request-level takes precedence over client-level)
-    let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
-
     if let Some(proxy_option) = proxy {
-        // Use proxy connection
         let proxy_connector = if let Some(trust_store) = &req.trust_store_pem {
             ProxyConnector::new_with_trust_store(proxy_option.clone(), &Some(trust_store.clone()))?
         } else {
@@ -168,11 +179,11 @@ async fn pick_or_connect_stream(
         let target_port = req.url.port_or_known_default()
             .ok_or_else(|| anyhow!("URL must have a valid port"))?;
 
+        let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
         let stream = proxy_connector.connect(target_host, target_port, connect_timeout).await?;
-        return Ok(stream);
+        return Ok((stream, false));
     }
 
-    // Direct connection
     match req.url.scheme() {
         "http" => {
             let key = ConnectionKey {
@@ -180,24 +191,13 @@ async fn pick_or_connect_stream(
                 connection_type: ConnectionType::DirectTcp,
             };
 
-            if let Some(Some(mut stream_from_pool)) = CONNECTION_POOL.get_mut(&key).map(|mut x| x.pop()) {
-                if !is_stream_closed(&mut stream_from_pool).await {
-                    trace!("picking up direct TCP stream from pool");
-                    return Ok(stream_from_pool);
-                } else {
-                    info!(?addr, "stream was picked but it is closed");
-                }
-            } else {
-                trace!(?addr, "no existing TCP connection for this addr")
+            if let Some(stream_from_pool) = try_pick_from_pool(&key) {
+                trace!(?addr, "picking up direct TCP stream from pool");
+                return Ok((stream_from_pool, true));
             }
-
-            // Create TCP stream with connect timeout
-            let tcp_stream = match timeout(connect_timeout, TcpStream::connect(&addr)).await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(e)) => return Err(anyhow!("TCP connection failed: {e}")),
-                Err(_err) => return Err(anyhow!("TCP connection timeout after {:?}", connect_timeout)),
-            };
-            return Ok(Box::new(tcp_stream));
+            trace!(?addr, "no existing TCP connection for this addr");
+            let stream = connect_fresh_tcp(client, req, addr).await?;
+            Ok((stream, false))
         }
         "https" => {
             let key = ConnectionKey {
@@ -205,78 +205,75 @@ async fn pick_or_connect_stream(
                 connection_type: ConnectionType::DirectTls,
             };
 
-            if let Some(Some(mut stream_from_pool)) = CONNECTION_POOL.get_mut(&key).map(|mut x| x.pop()) {
-                if !is_stream_closed(&mut stream_from_pool).await {
-                    info!(?addr, "picking up direct TLS stream from pool");
-                    return Ok(stream_from_pool);
-                } else {
-                    info!(?addr, "stream was picked but it is closed");
-                }
-            } else {
-                trace!(?addr, "no existing TLS connection for this addr")
+            if let Some(stream_from_pool) = try_pick_from_pool(&key) {
+                trace!(?addr, "picking up direct TLS stream from pool");
+                return Ok((stream_from_pool, true));
             }
-
-            let tls_config = create_tls_config(&client.global_trust_store_pem).dot()?;
-            let tls_config = Arc::new(tls_config);
-            let tls_connector: TlsConnector = tls_config.into();
-            let host = if let url::Host::Domain(s) =
-                req.url.host().ok_or(anyhow!("no host in URL")).dot()?
-            {
-                s
-            } else {
-                return Err(anyhow!(
-                    "HTTPS request should specify the Domain instead of IP, or you can provide the sni doman name"
-                ));
-            };
-
-            // Create TCP stream with connect timeout
-            let tcp_stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(e)) => return Err(anyhow!("TCP connection failed: {e}")),
-                Err(_err) => return Err(anyhow!("TCP connection timeout after {:?}", connect_timeout)),
-            };
-
-            let tls_stream = tls_connector.connect(host, tcp_stream).await.dot()?;
-            return Ok(Box::new(tls_stream));
+            trace!(?addr, "no existing TLS connection for this addr");
+            let stream = connect_fresh_tls(client, req, addr).await?;
+            Ok((stream, false))
         }
-        others => return Err(anyhow!("scheme {others} is not supported at the moment")),
+        others => Err(anyhow!("scheme {others} is not supported at the moment")),
     }
 }
 
-async fn is_stream_closed(stream: &mut BoxedStream) -> bool {
-    if let Some(stream) = stream.as_any_mut().downcast_mut::<TlsStream<TcpStream>>() {
-        return is_stream_closed_inner(stream.get_mut()).await;
-    } else if let Some(stream) = stream.as_any_mut().downcast_mut::<TcpStream>() {
-        return is_stream_closed_inner(stream).await;
-    } else {
-        warn!("downcast failed");
-        return true;
+/// Create a fresh connection, skipping the pool entirely.
+/// Used for retry after a stale pooled connection fails.
+async fn connect_fresh_stream(
+    client: &ZJHttpClient,
+    req: &Request,
+    addr: &SocketAddr,
+) -> Result<BoxedStream> {
+    match req.url.scheme() {
+        "http" => connect_fresh_tcp(client, req, addr).await,
+        "https" => connect_fresh_tls(client, req, addr).await,
+        others => Err(anyhow!("scheme {others} is not supported at the moment")),
     }
+}
 
-    async fn is_stream_closed_inner(tcp: &mut TcpStream) -> bool {
-        let mut buf = [0u8; 1];
-        let result = timeout(Duration::from_secs(1), tcp.peek(&mut buf)).await;
-        match result {
-            Ok(result) => match result {
-                Ok(0) => {
-                    info!("read 0, stream is closed");
-                    return true;
-                }
-                Ok(n) => {
-                    info!("read {n}, stream is still open, but strange");
-                    return false;
-                }
-                Err(err) => {
-                    info!(?err, "get unexpected error, stream closed");
-                    return true;
-                }
-            },
-            Err(_e) => {
-                trace!("timeout, stream is still open");
-                return false;
-            }
-        }
-    }
+async fn connect_fresh_tcp(
+    client: &ZJHttpClient,
+    req: &Request,
+    addr: &SocketAddr,
+) -> Result<BoxedStream> {
+    let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
+    let tcp_stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(anyhow!("TCP connection failed: {e}")),
+        Err(_) => return Err(anyhow!("TCP connection timeout after {:?}", connect_timeout)),
+    };
+    Ok(Box::new(tcp_stream))
+}
+
+async fn connect_fresh_tls(
+    client: &ZJHttpClient,
+    req: &Request,
+    addr: &SocketAddr,
+) -> Result<BoxedStream> {
+    let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
+    let tls_config = create_tls_config(&client.global_trust_store_pem).dot()?;
+    let tls_connector: TlsConnector = Arc::new(tls_config).into();
+    let host = match req.url.host() {
+        Some(url::Host::Domain(s)) => s,
+        _ => return Err(anyhow!(
+            "HTTPS request should specify the Domain instead of IP, or you can provide the sni domain name"
+        )),
+    };
+    let tcp_stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(anyhow!("TCP connection failed: {e}")),
+        Err(_) => return Err(anyhow!("TCP connection timeout after {:?}", connect_timeout)),
+    };
+    let tls_stream = tls_connector.connect(host, tcp_stream).await.dot()?;
+    Ok(Box::new(tls_stream))
+}
+
+/// Try to pick a stream from the connection pool.
+/// Returns None if the pool is empty for this key.
+/// Does not pre-validate stream health — stale connections will fail naturally
+/// during the next read/write, at which point the caller can retry with a fresh connection.
+fn try_pick_from_pool(key: &ConnectionKey) -> Option<BoxedStream> {
+    CONNECTION_POOL.get_mut(key).and_then(|mut pool| pool.pop())
 }
 
 async fn resolve_1st_ip(req: &mut Request) -> Result<SocketAddr> {
