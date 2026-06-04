@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("Example 4 - Request with form body:");
     println!("URL: {}", request.url);
-    println!("Content-Type: {}", request.content_type);
+    println!("Content-Type: {:?}", request.content_type);
     println!("Content-Length: {}", request.content_length);
 
     Ok(())

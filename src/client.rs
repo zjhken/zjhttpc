@@ -123,7 +123,9 @@ impl ZJHttpClient {
         // Retry once with a fresh connection — body hasn't been consumed yet, so retry is safe.
         if let Err(e) = send_header(self, req, &mut stream).await {
             if reused {
-                trace!("pooled connection failed during send_header, retrying with fresh connection");
+                trace!(
+                    "pooled connection failed during send_header, retrying with fresh connection"
+                );
                 drop(stream);
                 stream = connect_fresh_stream(self, &req, &addr).await.dot()?;
                 send_header(self, req, &mut stream).await.dot()?;
@@ -172,15 +174,22 @@ async fn pick_or_connect_stream(
         let proxy_connector = if let Some(trust_store) = &req.trust_store_pem {
             ProxyConnector::new_with_trust_store(proxy_option.clone(), &Some(trust_store.clone()))?
         } else {
-            ProxyConnector::new_with_trust_store(proxy_option.clone(), &client.global_trust_store_pem)?
+            ProxyConnector::new_with_trust_store(
+                proxy_option.clone(),
+                &client.global_trust_store_pem,
+            )?
         };
 
         let target_host = req.url.host_str().ok_or(anyhow!("no host in URL"))?;
-        let target_port = req.url.port_or_known_default()
+        let target_port = req
+            .url
+            .port_or_known_default()
             .ok_or_else(|| anyhow!("URL must have a valid port"))?;
 
         let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
-        let stream = proxy_connector.connect(target_host, target_port, connect_timeout).await?;
+        let stream = proxy_connector
+            .connect(target_host, target_port, connect_timeout)
+            .await?;
         return Ok((stream, false));
     }
 
@@ -240,7 +249,12 @@ async fn connect_fresh_tcp(
     let tcp_stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => return Err(anyhow!("TCP connection failed: {e}")),
-        Err(_) => return Err(anyhow!("TCP connection timeout after {:?}", connect_timeout)),
+        Err(_) => {
+            return Err(anyhow!(
+                "TCP connection timeout after {:?}",
+                connect_timeout
+            ));
+        }
     };
     Ok(Box::new(tcp_stream))
 }
@@ -255,14 +269,21 @@ async fn connect_fresh_tls(
     let tls_connector: TlsConnector = Arc::new(tls_config).into();
     let host = match req.url.host() {
         Some(url::Host::Domain(s)) => s,
-        _ => return Err(anyhow!(
-            "HTTPS request should specify the Domain instead of IP, or you can provide the sni domain name"
-        )),
+        _ => {
+            return Err(anyhow!(
+                "HTTPS request should specify the Domain instead of IP, or you can provide the sni domain name"
+            ));
+        }
     };
     let tcp_stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => return Err(anyhow!("TCP connection failed: {e}")),
-        Err(_) => return Err(anyhow!("TCP connection timeout after {:?}", connect_timeout)),
+        Err(_) => {
+            return Err(anyhow!(
+                "TCP connection timeout after {:?}",
+                connect_timeout
+            ));
+        }
     };
     let tls_stream = tls_connector.connect(host, tcp_stream).await.dot()?;
     Ok(Box::new(tls_stream))
@@ -336,7 +357,9 @@ where
     S: async_std::io::Read + async_std::io::Write + Unpin + Send + Sync + 'static,
 {
     // Apply send header timeout
-    let timeout_dur = req.send_header_timeout.unwrap_or(client.global_send_header_timeout);
+    let timeout_dur = req
+        .send_header_timeout
+        .unwrap_or(client.global_send_header_timeout);
     let send_future = async {
         stream.write_all(req.method.as_bytes()).await.dot()?;
         stream.write_all(b" ").await.dot()?;
@@ -359,6 +382,18 @@ where
                 .await
                 .dot()?;
             stream.write_all(b"\r\n").await.dot()?;
+        }
+        // Write Content-Type if set and user hasn't manually set it in headers
+        if let Some(ct) = req.content_type {
+            let already_set = req
+                .headers
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("content-type"));
+            if !already_set {
+                stream.write_all(b"Content-Type: ").await.dot()?;
+                stream.write_all(ct.as_bytes()).await.dot()?;
+                stream.write_all(b"\r\n").await.dot()?;
+            }
         }
         stream.write_all(b"Content-Length: ").await.dot()?;
         stream
@@ -454,22 +489,37 @@ where
                 match field {
                     crate::body::MultipartField::Text(name, value) => {
                         stream_to_write
-                            .write_all(format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes())
-                            .await.dot()?;
+                            .write_all(
+                                format!(
+                                    "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                                    name
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .dot()?;
                         stream_to_write.write_all(value.as_bytes()).await.dot()?;
                         stream_to_write.write_all(b"\r\n").await.dot()?;
                     }
-                    crate::body::MultipartField::FilePath(name, path, filename_opt, content_type_opt) => {
-                        let filename = filename_opt.as_ref()
-                            .map(|f| f.as_str())
-                            .unwrap_or_else(|| {
-                                path.file_name().and_then(|n| n.to_str()).unwrap_or("filename")
-                            });
-                        let content_type = content_type_opt.as_ref()
+                    crate::body::MultipartField::FilePath(
+                        name,
+                        path,
+                        filename_opt,
+                        content_type_opt,
+                    ) => {
+                        let filename =
+                            filename_opt
+                                .as_ref()
+                                .map(|f| f.as_str())
+                                .unwrap_or_else(|| {
+                                    path.file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("filename")
+                                });
+                        let content_type = content_type_opt
+                            .as_ref()
                             .map(|c| c.as_str())
-                            .unwrap_or_else(|| {
-                                crate::body::detect_mime_type(filename)
-                            });
+                            .unwrap_or_else(|| crate::body::detect_mime_type(filename));
 
                         stream_to_write
                             .write_all(format!(
@@ -479,7 +529,8 @@ where
                             .await.dot()?;
                         stream_to_write
                             .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
-                            .await.dot()?;
+                            .await
+                            .dot()?;
 
                         // Read and write file content
                         let mut file = async_std::fs::File::open(path).await.dot()?;
@@ -493,13 +544,20 @@ where
                         }
                         stream_to_write.write_all(b"\r\n").await.dot()?;
                     }
-                    crate::body::MultipartField::File(name, file, filename_opt, content_type_opt) => {
-                        let filename = filename_opt.as_ref().map(|f| f.as_str()).unwrap_or("filename");
-                        let content_type = content_type_opt.as_ref()
+                    crate::body::MultipartField::File(
+                        name,
+                        file,
+                        filename_opt,
+                        content_type_opt,
+                    ) => {
+                        let filename = filename_opt
+                            .as_ref()
+                            .map(|f| f.as_str())
+                            .unwrap_or("filename");
+                        let content_type = content_type_opt
+                            .as_ref()
                             .map(|c| c.as_str())
-                            .unwrap_or_else(|| {
-                                crate::body::detect_mime_type(filename)
-                            });
+                            .unwrap_or_else(|| crate::body::detect_mime_type(filename));
 
                         stream_to_write
                             .write_all(format!(
@@ -509,7 +567,8 @@ where
                             .await.dot()?;
                         stream_to_write
                             .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
-                            .await.dot()?;
+                            .await
+                            .dot()?;
 
                         // Read and write file content
                         let mut file = file;
@@ -523,13 +582,20 @@ where
                         }
                         stream_to_write.write_all(b"\r\n").await.dot()?;
                     }
-                    crate::body::MultipartField::Stream(name, mut stream, filename_opt, content_type_opt) => {
-                        let filename = filename_opt.as_ref().map(|f| f.as_str()).unwrap_or("filename");
-                        let content_type = content_type_opt.as_ref()
+                    crate::body::MultipartField::Stream(
+                        name,
+                        mut stream,
+                        filename_opt,
+                        content_type_opt,
+                    ) => {
+                        let filename = filename_opt
+                            .as_ref()
+                            .map(|f| f.as_str())
+                            .unwrap_or("filename");
+                        let content_type = content_type_opt
+                            .as_ref()
                             .map(|c| c.as_str())
-                            .unwrap_or_else(|| {
-                                crate::body::detect_mime_type(filename)
-                            });
+                            .unwrap_or_else(|| crate::body::detect_mime_type(filename));
 
                         stream_to_write
                             .write_all(format!(
@@ -539,7 +605,8 @@ where
                             .await.dot()?;
                         stream_to_write
                             .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
-                            .await.dot()?;
+                            .await
+                            .dot()?;
 
                         // Read and write stream content
                         let mut buf = vec![0u8; 1024 * 64]; // 64KB buffer
@@ -576,7 +643,9 @@ async fn read_headers_to_resp(
     // Read all headers at once (including status line) until \r\n\r\n
     let all_headers = {
         let fut = read_until(&mut stream, b"\r\n\r\n");
-        let dur = req.read_header_timeout.unwrap_or(client.global_read_header_timeout);
+        let dur = req
+            .read_header_timeout
+            .unwrap_or(client.global_read_header_timeout);
         future::timeout(dur, fut).await.dot()??
     };
 
@@ -755,7 +824,7 @@ pub fn return_stream_to_pool(stream: BoxedStream, stream_info: StreamInfo) {
 }
 
 /// Return a stream from a Response object to the appropriate connection pool
-/// 
+///
 /// This function maintains backward compatibility by extracting the necessary
 /// metadata from the Response object and delegating to the new return_stream_to_pool function.
 /// The preferred approach for new code is to use return_stream_to_pool directly.
@@ -928,21 +997,33 @@ mod tests {
         let proxy = HttpsProxyOption::new("http://proxy.example.com:8080").unwrap();
         client = client.set_proxy(proxy.clone());
         assert!(client.global_proxy.is_some());
-        assert_eq!(client.global_proxy.unwrap().url.host_str().unwrap(), "proxy.example.com");
+        assert_eq!(
+            client.global_proxy.unwrap().url.host_str().unwrap(),
+            "proxy.example.com"
+        );
     }
 
     #[test]
     fn test_client_proxy_from_url() {
-        let result = ZJHttpClient::builder().build().unwrap().set_proxy_from_url("http://proxy.example.com:8080");
+        let result = ZJHttpClient::builder()
+            .build()
+            .unwrap()
+            .set_proxy_from_url("http://proxy.example.com:8080");
         assert!(result.is_ok());
         let client = result.unwrap();
         assert!(client.global_proxy.is_some());
-        assert_eq!(client.global_proxy.unwrap().url.host_str().unwrap(), "proxy.example.com");
+        assert_eq!(
+            client.global_proxy.unwrap().url.host_str().unwrap(),
+            "proxy.example.com"
+        );
     }
 
     #[test]
     fn test_client_invalid_proxy_url() {
-        let result = ZJHttpClient::builder().build().unwrap().set_proxy_from_url("invalid-url");
+        let result = ZJHttpClient::builder()
+            .build()
+            .unwrap()
+            .set_proxy_from_url("invalid-url");
         assert!(result.is_err());
     }
 

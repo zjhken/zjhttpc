@@ -21,7 +21,7 @@ pub struct Request {
     pub url: Url,
     pub headers: HashMap<String, IndexSet<String>>,
     pub expect_continue: bool,
-    pub content_type: &'static str,
+    pub content_type: Option<&'static str>,
     pub basic_auth: Option<(String, String)>,
     pub content_length: u64,
     pub send_header_timeout: Option<Duration>,
@@ -48,7 +48,7 @@ impl Request {
             url,
             headers,
             expect_continue: false,
-            content_type: "application/octet-stream",
+            content_type: None,
             basic_auth: None,
             body: Body::None,
             content_length: 0,
@@ -152,7 +152,7 @@ impl Request {
     }
 
     pub fn set_content_type(mut self, content_type: &'static str) -> Self {
-        self.content_type = content_type;
+        self.content_type = Some(content_type);
         self
     }
 
@@ -226,7 +226,7 @@ impl Request {
     #[must_use]
     pub fn set_body_form(mut self, form: BodyForm) -> Self {
         // Auto-set Content-Type to application/x-www-form-urlencoded
-        self.content_type = "application/x-www-form-urlencoded";
+        self.content_type = Some("application/x-www-form-urlencoded");
 
         // Serialize the form data
         let serialized = form.serialize();
@@ -270,10 +270,10 @@ impl Request {
     pub fn set_body_multipart_form(mut self, form: BodyMultipartForm) -> Self {
         // Auto-set Content-Type to multipart/form-data with boundary
         let boundary = form.boundary().to_string();
-        self.content_type = Box::leak(
+        self.content_type = Some(Box::leak(
             format!("multipart/form-data; boundary={}", boundary)
                 .into_boxed_str()
-        );
+        ));
 
         // For multipart forms, we can't know the content-length upfront
         // without reading all files, so set to 0 (will use chunked encoding)
@@ -518,18 +518,18 @@ mod tests {
             .unwrap()
             .set_content_type(content_type::APPLICATION_JSON);
 
-        assert_eq!(request.content_type, "application/json");
+        assert_eq!(request.content_type, Some("application/json"));
 
         let request = Request::new("POST", "http://example.com")
             .unwrap()
             .set_content_type(content_type::TEXT_HTML);
 
-        assert_eq!(request.content_type, "text/html");
+        assert_eq!(request.content_type, Some("text/html"));
 
         let request = Request::new("POST", "http://example.com")
             .unwrap()
             .set_content_type(content_type::IMAGE_PNG);
 
-        assert_eq!(request.content_type, "image/png");
+        assert_eq!(request.content_type, Some("image/png"));
     }
 }

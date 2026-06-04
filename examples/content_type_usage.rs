@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_content_type(content_type::APPLICATION_JSON)
         .set_body_string(r#"{"key": "value"}"#);
 
-    println!("Request 1 - Content-Type: {}", request1.content_type);
+    println!("Request 1 - Content-Type: {:?}", request1.content_type);
 
     // Example 6: Using various content-type constants
     println!("\nAvailable content-type constants:");
