@@ -141,9 +141,22 @@ impl ZJHttpClient {
 
     pub async fn send_header_only(&self, req: &mut Request) -> Result<(BoxedStream, SocketAddr)> {
         let addr = resolve_1st_ip(req).await.dot()?;
-        let (mut stream, _) = pick_or_connect_stream(self, &req, &addr).await.dot()?;
-        send_header(self, req, &mut stream).await.dot()?;
-        return Ok((stream, addr));
+        let (mut stream, reused) = pick_or_connect_stream(self, &req, &addr).await.dot()?;
+
+        if let Err(e) = send_header(self, req, &mut stream).await {
+            if reused {
+                trace!(
+                    "pooled connection failed during send_header, retrying with fresh connection"
+                );
+                drop(stream);
+                stream = connect_fresh_stream(self, &req, &addr).await.dot()?;
+                send_header(self, req, &mut stream).await.dot()?;
+            } else {
+                return Err(e);
+            }
+        }
+
+        Ok((stream, addr))
     }
 
     pub async fn send_body_only(
