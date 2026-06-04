@@ -837,18 +837,21 @@ pub fn return_stream_to_pool(stream: BoxedStream, stream_info: StreamInfo) {
     };
 
     // Return stream to the unified pool
-    if let Some(mut pool) = CONNECTION_POOL.get_mut(&key) {
-        let len = pool.len();
-        if len <= 30 {
-            pool.push(stream);
-            let len = pool.len();
-            trace!(key = ?(&key.addr, &key.connection_type), len, "stream returned to pool");
-        } else {
-            trace!(key = ?(&key.addr, &key.connection_type), len, "pool is full");
+    use dashmap::mapref::entry::Entry;
+    match CONNECTION_POOL.entry(key.clone()) {
+        Entry::Occupied(mut entry) => {
+            let pool = entry.get_mut();
+            if pool.len() <= 30 {
+                pool.push(stream);
+                trace!(key = ?(&key.addr, &key.connection_type), len = pool.len(), "stream returned to pool");
+            } else {
+                trace!(key = ?(&key.addr, &key.connection_type), len = pool.len(), "pool is full");
+            }
         }
-    } else {
-        CONNECTION_POOL.insert(key.clone(), vec![stream]);
-        trace!(key = ?(&key.addr, &key.connection_type), "add new vec to pool");
+        Entry::Vacant(entry) => {
+            entry.insert(vec![stream]);
+            trace!(key = ?(&key.addr, &key.connection_type), "add new vec to pool");
+        }
     }
 }
 
