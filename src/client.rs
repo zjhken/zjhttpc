@@ -171,6 +171,22 @@ async fn pick_or_connect_stream(
     let proxy = req.proxy.as_ref().or(client.global_proxy.as_ref());
 
     if let Some(proxy_option) = proxy {
+        let connection_type = if proxy_option.url.scheme() == "https" {
+            ConnectionType::ProxyTls(proxy_option.addr)
+        } else {
+            ConnectionType::ProxyTcp(proxy_option.addr)
+        };
+
+        let key = ConnectionKey {
+            addr: *addr,
+            connection_type,
+        };
+
+        if let Some(stream_from_pool) = try_pick_from_pool(&key) {
+            trace!(?addr, "picking up proxy stream from pool");
+            return Ok((stream_from_pool, true));
+        }
+
         let proxy_connector = if let Some(trust_store) = &req.trust_store_pem {
             ProxyConnector::new_with_trust_store(proxy_option.clone(), &Some(trust_store.clone()))?
         } else {
