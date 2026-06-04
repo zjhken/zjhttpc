@@ -424,7 +424,13 @@ impl async_std::io::Read for BodyFixedLengthStream {
             match std::pin::Pin::new(inner_stream).poll_read(cx, &mut buf[..to_read]) {
                 std::task::Poll::Ready(Ok(n)) => {
                     if n == 0 {
-                        return std::task::Poll::Ready(Ok(0));
+                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "unexpected end of stream: {} bytes remaining of declared Content-Length",
+                                self.remaining
+                            ),
+                        )));
                     }
 
                     self.remaining -= n;
