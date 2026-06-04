@@ -194,22 +194,7 @@ impl ProxyConnector {
             .await
             .context("failed to flush proxy connection")?;
 
-        let mut buffer = vec![0u8; 1024];
-        let n = tcp_stream
-            .read(&mut buffer)
-            .await
-            .context("failed to read proxy response")?;
-
-        if n == 0 {
-            return Err(anyhow!("proxy closed connection before responding"));
-        }
-
-        let response =
-            std::str::from_utf8(&buffer[..n]).context("proxy response is not valid UTF-8")?;
-
-        if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
-            return Err(anyhow!("proxy CONNECT failed: {}", response.trim()));
-        }
+        read_connect_response(&mut tcp_stream).await?;
 
         debug!(
             "HTTP proxy CONNECT successful to {}:{}",
@@ -271,28 +256,46 @@ impl ProxyConnector {
             .await
             .context("failed to flush proxy connection")?;
 
-        let mut buffer = vec![0u8; 1024];
-        let n = stream
-            .read(&mut buffer)
-            .await
-            .context("failed to read proxy response")?;
-
-        if n == 0 {
-            return Err(anyhow!("proxy closed connection before responding"));
-        }
-
-        let response =
-            std::str::from_utf8(&buffer[..n]).context("proxy response is not valid UTF-8")?;
-
-        if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
-            return Err(anyhow!("proxy CONNECT failed: {}", response.trim()));
-        }
+        read_connect_response(&mut stream).await?;
 
         debug!(
             "HTTPS proxy CONNECT successful to {}:{}",
             target_host, target_port
         );
         Ok(stream)
+    }
+}
+
+/// Read the proxy CONNECT response fully by looping until \\r\\n\\r\\n is found.
+/// Returns Ok(()) if the response status is 200, or Err with the response text otherwise.
+async fn read_connect_response<S>(stream: &mut S) -> Result<()>
+where
+    S: async_std::io::Read + Unpin,
+{
+    let mut buf = [0u8; 512];
+    let mut filled = 0;
+
+    loop {
+        let n = stream
+            .read(&mut buf[filled..])
+            .await
+            .context("failed to read proxy CONNECT response")?;
+        if n == 0 {
+            return Err(anyhow!("proxy closed connection before responding"));
+        }
+        filled += n;
+
+        if filled > 512 {
+            return Err(anyhow!("proxy CONNECT response too large, giving up"));
+        }
+
+        if filled >= 4 && buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
+            if !buf.starts_with(b"HTTP/1.1 200") && !buf.starts_with(b"HTTP/1.0 200") {
+                let text = String::from_utf8_lossy(&buf[..filled]);
+                return Err(anyhow!("proxy CONNECT failed: {}", text.trim()));
+            }
+            return Ok(());
+        }
     }
 }
 
