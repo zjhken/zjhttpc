@@ -12,7 +12,7 @@ use crate::{
     error::ZjhttpcError,
     misc::HttpVersion,
     proxy::HttpsProxyOption,
-    stream::BoxedStream,
+    stream::{BoxedStream, ChainRead, SliceRead},
 };
 use std::sync::{
     Arc,
@@ -21,15 +21,12 @@ use std::sync::{
 
 /// A streaming chunked decoder that processes chunks on-the-fly without buffering the entire body
 pub struct ChunkedDecoderStream {
-    inner: Option<BoxedStream>,
+    inner: Option<ChainedInner>,
     state: DecoderState,
     chunk_remaining: usize,
     line_buffer: Vec<u8>,
-    /// Internal buffer for chunk trailer reading
     trailer_buffer: Vec<u8>,
-    /// Shared flag to track if the stream was fully consumed
     completion_flag: Arc<AtomicBool>,
-    /// Connection info for returning to pool
     addr: SocketAddr,
     is_tls: bool,
     proxy_used: Option<HttpsProxyOption>,
@@ -37,11 +34,9 @@ pub struct ChunkedDecoderStream {
 
 /// A fixed-length stream that tracks remaining bytes and returns 0 when complete
 pub struct BodyFixedLengthStream {
-    inner: Option<BoxedStream>,
+    inner: Option<ChainedInner>,
     remaining: usize,
-    /// Shared flag to track if the stream was fully consumed
     completion_flag: Arc<AtomicBool>,
-    /// Connection info for returning to pool
     addr: SocketAddr,
     is_tls: bool,
     proxy_used: Option<HttpsProxyOption>,
@@ -49,14 +44,14 @@ pub struct BodyFixedLengthStream {
 
 /// A stream wrapper for responses with unknown length that returns the stream to pool when EOF is reached
 pub struct BodyUnknownLengthStream {
-    inner: Option<BoxedStream>,
-    /// Shared flag to track if the stream was fully consumed
+    inner: Option<ChainedInner>,
     completion_flag: Arc<AtomicBool>,
-    /// Connection info for returning to pool
     addr: SocketAddr,
     is_tls: bool,
     proxy_used: Option<HttpsProxyOption>,
 }
+
+type ChainedInner = ChainRead<SliceRead, BoxedStream>;
 
 #[derive(Debug, Clone, PartialEq)]
 enum DecoderState {
@@ -68,7 +63,7 @@ enum DecoderState {
 }
 
 impl ChunkedDecoderStream {
-    pub fn new(inner: BoxedStream) -> Self {
+    pub fn new(inner: ChainedInner) -> Self {
         Self {
             inner: Some(inner),
             state: DecoderState::ReadingChunkSizeLine,
@@ -83,7 +78,7 @@ impl ChunkedDecoderStream {
     }
 
     pub fn new_with_completion_flag(
-        inner: BoxedStream,
+        inner: ChainedInner,
         completion_flag: Arc<AtomicBool>,
         addr: SocketAddr,
         is_tls: bool,
@@ -108,7 +103,8 @@ impl ChunkedDecoderStream {
 
     /// Return the original stream to the connection pool when fully consumed
     fn return_stream_to_pool(&mut self) {
-        if let Some(stream) = self.inner.take() {
+        if let Some(chain) = self.inner.take() {
+            let stream = chain.into_second();
             let stream_info = crate::client::StreamInfo {
                 addr: self.addr,
                 is_tls: self.is_tls,
@@ -207,31 +203,31 @@ impl async_std::io::Read for ChunkedDecoderStream {
                     }
 
                     let to_read = std::cmp::min(buf.len(), self.chunk_remaining);
-
-                    if let Some(inner_stream) = &mut self.inner {
-                        match std::pin::Pin::new(inner_stream).poll_read(cx, &mut buf[..to_read])
-                        {
-                            std::task::Poll::Ready(Ok(n)) => {
-                                if n == 0 {
-                                    return std::task::Poll::Ready(Err(std::io::Error::new(
-                                        std::io::ErrorKind::UnexpectedEof,
-                                        "unexpected end of stream while reading chunk data",
-                                    )));
-                                }
-
-                                self.chunk_remaining -= n;
-                                return std::task::Poll::Ready(Ok(n));
-                            }
-                            std::task::Poll::Ready(Err(e)) => {
-                                return std::task::Poll::Ready(Err(e));
-                            }
-                            std::task::Poll::Pending => return std::task::Poll::Pending,
+                    let inner_stream = match &mut self.inner {
+                        Some(s) => s,
+                        None => {
+                            return std::task::Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "stream is None",
+                            )));
                         }
-                    } else {
-                        return std::task::Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "stream is None",
-                        )));
+                    };
+                    match std::pin::Pin::new(inner_stream).poll_read(cx, &mut buf[..to_read]) {
+                        std::task::Poll::Ready(Ok(n)) => {
+                            if n == 0 {
+                                return std::task::Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "unexpected end of stream while reading chunk data",
+                                )));
+                            }
+
+                            self.chunk_remaining -= n;
+                            return std::task::Poll::Ready(Ok(n));
+                        }
+                        std::task::Poll::Ready(Err(e)) => {
+                            return std::task::Poll::Ready(Err(e));
+                        }
+                        std::task::Poll::Pending => return std::task::Poll::Pending,
                     }
                 }
                 DecoderState::ReadingChunkTrailerLine => {
@@ -327,35 +323,8 @@ impl async_std::io::Read for ChunkedDecoderStream {
     }
 }
 
-impl async_std::io::Write for ChunkedDecoderStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        _buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::task::Poll::Ready(Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "ChunkedDecoderStream is read-only",
-        )))
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
 impl BodyFixedLengthStream {
-    pub fn new(inner: BoxedStream, content_length: usize) -> Self {
+    pub fn new(inner: ChainedInner, content_length: usize) -> Self {
         Self {
             inner: Some(inner),
             remaining: content_length,
@@ -367,7 +336,7 @@ impl BodyFixedLengthStream {
     }
 
     pub fn new_with_completion_flag(
-        inner: BoxedStream,
+        inner: ChainedInner,
         content_length: usize,
         completion_flag: Arc<AtomicBool>,
         addr: SocketAddr,
@@ -388,9 +357,9 @@ impl BodyFixedLengthStream {
         self.completion_flag.load(Ordering::Relaxed)
     }
 
-    /// Return the original stream to the connection pool when fully consumed
     fn return_stream_to_pool(&mut self) {
-        if let Some(stream) = self.inner.take() {
+        if let Some(chain) = self.inner.take() {
+            let stream = chain.into_second();
             let stream_info = crate::client::StreamInfo {
                 addr: self.addr,
                 is_tls: self.is_tls,
@@ -453,36 +422,9 @@ impl async_std::io::Read for BodyFixedLengthStream {
     }
 }
 
-impl async_std::io::Write for BodyFixedLengthStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        _buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::task::Poll::Ready(Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "BodyFixedLengthStream is read-only",
-        )))
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
 impl BodyUnknownLengthStream {
     pub fn new_with_completion_flag(
-        inner: BoxedStream,
+        inner: ChainedInner,
         completion_flag: Arc<AtomicBool>,
         addr: SocketAddr,
         is_tls: bool,
@@ -501,9 +443,9 @@ impl BodyUnknownLengthStream {
         self.completion_flag.load(Ordering::Relaxed)
     }
 
-    /// Return the original stream to the connection pool when fully consumed
     fn return_stream_to_pool(&mut self) {
-        if let Some(stream) = self.inner.take() {
+        if let Some(chain) = self.inner.take() {
+            let stream = chain.into_second();
             let stream_info = crate::client::StreamInfo {
                 addr: self.addr,
                 is_tls: self.is_tls,
@@ -527,7 +469,6 @@ impl async_std::io::Read for BodyUnknownLengthStream {
         if let Some(inner_stream) = &mut self.inner {
             match std::pin::Pin::new(inner_stream).poll_read(cx, buf) {
                 std::task::Poll::Ready(Ok(0)) => {
-                    // EOF reached - mark as completed and return to pool
                     self.completion_flag.store(true, Ordering::Relaxed);
                     self.return_stream_to_pool();
                     std::task::Poll::Ready(Ok(0))
@@ -545,39 +486,6 @@ impl async_std::io::Read for BodyUnknownLengthStream {
     }
 }
 
-impl async_std::io::Write for BodyUnknownLengthStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        _buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::task::Poll::Ready(Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "BodyUnknownLengthStream is read-only",
-        )))
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
-impl crate::stream::RWStream for BodyFixedLengthStream {}
-
-impl crate::stream::RWStream for ChunkedDecoderStream {}
-
-impl crate::stream::RWStream for BodyUnknownLengthStream {}
-
 pub struct Response {
     pub addr: SocketAddr,
     pub is_tls: bool,
@@ -587,6 +495,9 @@ pub struct Response {
     /// If you use this raw stream directly, call mark_body_read_complete() when done
     /// If you use body_managed_stream() instead, the returned wrapper handles this automatically
     pub body_raw_stream: Option<BoxedStream>,
+    /// Bytes read past the header delimiter, to be served before reading from the stream
+    body_prefix: [u8; 4096],
+    body_prefix_len: usize,
     pub proxy_used: Option<HttpsProxyOption>,
     /// Track if the response body has been fully consumed
     /// This is used to determine if the connection should be returned to pool on Drop
@@ -630,6 +541,7 @@ impl Response {
         addr: SocketAddr,
         proxy_used: Option<HttpsProxyOption>,
         read_body_timeout: Option<std::time::Duration>,
+        body_prefix: &[u8],
     ) -> Result<Self, ZjhttpcError> {
         let http_version = match http_version {
             "1.1" => HttpVersion::V1_1,
@@ -652,12 +564,17 @@ impl Response {
                 }
             };
         }
+        let mut prefix_buf = [0u8; 4096];
+        let prefix_len = body_prefix.len().min(4096);
+        prefix_buf[..prefix_len].copy_from_slice(&body_prefix[..prefix_len]);
         let resp = Response {
             is_tls,
             http_version,
             status_code,
             headers,
             body_raw_stream: Some(stream),
+            body_prefix: prefix_buf,
+            body_prefix_len: prefix_len,
             addr,
             proxy_used,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
@@ -773,7 +690,7 @@ impl Response {
     /// - All wrapper streams automatically return the connection to the pool when fully consumed (EOF reached).
     /// - Once you use this stream, you become responsible for reading it completely.
     /// - If you don't read the stream completely, the connection may not be reusable.
-    pub fn body_managed_stream(&mut self) -> Option<BoxedStream> {
+    pub fn body_managed_stream(&mut self) -> Option<crate::stream::ReadStream> {
         if self.is_body_read_complete() {
             return None;
         }
@@ -789,37 +706,47 @@ impl Response {
         let content_length = self.content_length();
 
         if let Some(stream) = self.body_raw_stream.take() {
+            let prefix = &self.body_prefix[..self.body_prefix_len];
             if is_chunked {
-                // For chunked encoding, wrap the stream with our decoder
-                let decoder = ChunkedDecoderStream::new_with_completion_flag(
+                let chain = crate::stream::ChainRead::new(
+                    crate::stream::SliceRead::new(prefix),
                     stream,
+                );
+                let decoder = ChunkedDecoderStream::new_with_completion_flag(
+                    chain,
                     self.body_completion_flag.clone(),
                     self.addr,
                     self.is_tls,
                     self.proxy_used.clone(),
                 );
-                Some(Box::new(decoder))
+                Some(Box::new(decoder) as crate::stream::ReadStream)
             } else if let Some(length) = content_length {
-                // For responses with Content-Length, use BodyFixedLengthStream
-                let fixed_length_stream = BodyFixedLengthStream::new_with_completion_flag(
+                let chain = crate::stream::ChainRead::new(
+                    crate::stream::SliceRead::new(prefix),
                     stream,
+                );
+                let fixed_length_stream = BodyFixedLengthStream::new_with_completion_flag(
+                    chain,
                     length as usize,
                     self.body_completion_flag.clone(),
                     self.addr,
                     self.is_tls,
                     self.proxy_used.clone(),
                 );
-                Some(Box::new(fixed_length_stream))
+                Some(Box::new(fixed_length_stream) as crate::stream::ReadStream)
             } else {
-                // For other responses, wrap with BodyUnknownLengthStream for completion tracking
-                let unknown_length_stream = BodyUnknownLengthStream::new_with_completion_flag(
+                let chain = crate::stream::ChainRead::new(
+                    crate::stream::SliceRead::new(prefix),
                     stream,
+                );
+                let unknown_length_stream = BodyUnknownLengthStream::new_with_completion_flag(
+                    chain,
                     self.body_completion_flag.clone(),
                     self.addr,
                     self.is_tls,
                     self.proxy_used.clone(),
                 );
-                Some(Box::new(unknown_length_stream))
+                Some(Box::new(unknown_length_stream) as crate::stream::ReadStream)
             }
         } else {
             None
@@ -1026,7 +953,11 @@ mod tests {
         let boxed_stream = Box::new(test_stream) as BoxedStream;
 
         // Create BodyFixedLengthStream with exact content length
-        let mut fixed_stream = BodyFixedLengthStream::new(boxed_stream, data.len());
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(&[]),
+            boxed_stream,
+        );
+        let mut fixed_stream = BodyFixedLengthStream::new(chain, data.len());
 
         // Test reading the entire content
         let mut buffer = Vec::new();
@@ -1109,7 +1040,11 @@ mod tests {
         let boxed_stream = Box::new(test_stream) as BoxedStream;
 
         // Create BodyFixedLengthStream with exact content length
-        let mut fixed_stream = BodyFixedLengthStream::new(boxed_stream, data.len());
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(&[]),
+            boxed_stream,
+        );
+        let mut fixed_stream = BodyFixedLengthStream::new(chain, data.len());
 
         // Test reading partial content
         let mut buffer = [0u8; 5];
@@ -1129,8 +1064,6 @@ mod tests {
 
     #[test]
     fn test_chunked_decoder_stream_basic() {
-        use async_std::io::ReadExt;
-
         // Create a test stream that simulates chunked encoded data
         struct TestChunkedStream {
             data: Vec<u8>,
@@ -1200,7 +1133,11 @@ mod tests {
         let boxed_stream = Box::new(test_stream) as BoxedStream;
 
         // Test ChunkedDecoderStream
-        let mut decoder = ChunkedDecoderStream::new(boxed_stream);
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(&[]),
+            boxed_stream,
+        );
+        let mut decoder = ChunkedDecoderStream::new(chain);
 
         // Read all data
         let mut buffer = Vec::new();
@@ -1285,8 +1222,12 @@ mod tests {
 
         // Create BodyUnknownLengthStream
         let completion_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut unknown_stream = BodyUnknownLengthStream::new_with_completion_flag(
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(&[]),
             boxed_stream,
+        );
+        let mut unknown_stream = BodyUnknownLengthStream::new_with_completion_flag(
+            chain,
             completion_flag,
             std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             false,
@@ -1401,6 +1342,8 @@ mod tests {
             status_code: 200,
             headers: HashMap::new(),
             body_raw_stream: None,
+            body_prefix: [0u8; 4096],
+            body_prefix_len: 0,
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
@@ -1425,6 +1368,8 @@ mod tests {
             status_code: 200,
             headers: HashMap::new(),
             body_raw_stream: None,
+            body_prefix: [0u8; 4096],
+            body_prefix_len: 0,
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
@@ -1456,6 +1401,8 @@ mod tests {
             status_code: 200,
             headers: HashMap::new(),
             body_raw_stream: None,
+            body_prefix: [0u8; 4096],
+            body_prefix_len: 0,
             proxy_used: None,
             body_completion_flag: completion_flag.clone(),
             read_body_timeout: None,
@@ -1473,8 +1420,6 @@ mod tests {
 
     #[test]
     fn test_body_fixed_length_stream_zero_length() {
-        use async_std::io::ReadExt;
-
         // Create a test stream with some data
         struct TestStream {
             data: Vec<u8>,
@@ -1538,7 +1483,11 @@ mod tests {
         let boxed_stream = Box::new(test_stream) as BoxedStream;
 
         // Create BodyFixedLengthStream with zero content length
-        let mut fixed_stream = BodyFixedLengthStream::new(boxed_stream, 0);
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(&[]),
+            boxed_stream,
+        );
+        let mut fixed_stream = BodyFixedLengthStream::new(chain, 0);
 
         // Test that reading returns 0 immediately
         let mut buffer = [0u8; 10];
@@ -1551,8 +1500,6 @@ mod tests {
 
     #[test]
     fn test_body_bytes_method() {
-        use async_std::io::ReadExt;
-
         // Create a test stream
         struct TestStream {
             data: Vec<u8>,
@@ -1634,6 +1581,8 @@ mod tests {
             status_code: 200,
             headers,
             body_raw_stream: Some(boxed_stream),
+            body_prefix: [0u8; 4096],
+            body_prefix_len: 0,
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
@@ -1648,8 +1597,6 @@ mod tests {
 
     #[test]
     fn test_body_json_method() {
-        use async_std::io::ReadExt;
-
         // Create a test stream with JSON data
         struct TestStream {
             data: Vec<u8>,
@@ -1731,6 +1678,8 @@ mod tests {
             status_code: 200,
             headers,
             body_raw_stream: Some(boxed_stream),
+            body_prefix: [0u8; 4096],
+            body_prefix_len: 0,
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
@@ -1749,8 +1698,6 @@ mod tests {
 
     #[test]
     fn test_body_json_invalid_json() {
-        use async_std::io::ReadExt;
-
         // Create a test stream with invalid JSON data
         struct TestStream {
             data: Vec<u8>,
@@ -1826,6 +1773,8 @@ mod tests {
             status_code: 200,
             headers: hashbrown::HashMap::new(),
             body_raw_stream: Some(boxed_stream),
+            body_prefix: [0u8; 4096],
+            body_prefix_len: 0,
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
@@ -1836,5 +1785,212 @@ mod tests {
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("JSON parsing failed"));
+    }
+
+    // ==================== Prefix behavior tests ====================
+
+    /// Helper: a minimal Read+Write stream backed by a byte slice.
+    struct MockStream {
+        data: Vec<u8>,
+        pos: usize,
+    }
+    impl MockStream {
+        fn new(data: &[u8]) -> Self {
+            Self { data: data.to_vec(), pos: 0 }
+        }
+    }
+    impl async_std::io::Read for MockStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let n = std::cmp::min(buf.len(), self.data.len() - self.pos);
+            if n == 0 { return std::task::Poll::Ready(Ok(0)); }
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(n))
+        }
+    }
+    impl async_std::io::Write for MockStream {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>, _buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "readonly")))
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+    }
+    impl crate::stream::RWStream for MockStream {}
+
+    #[test]
+    fn test_body_fixed_length_stream_prefix() {
+        use async_std::io::ReadExt;
+
+        // prefix contains "Hello, ", inner stream contains "World!"
+        let inner = MockStream::new(b"World!");
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(b"Hello, "),
+            Box::new(inner) as BoxedStream,
+        );
+        let mut stream = BodyFixedLengthStream::new_with_completion_flag(
+            chain,
+            13,
+            Arc::new(AtomicBool::new(false)),
+            "127.0.0.1:8080".parse().unwrap(),
+            false,
+            None,
+        );
+
+        let mut out = Vec::new();
+        async_std::task::block_on(stream.read_to_end(&mut out)).unwrap();
+        assert_eq!(out, b"Hello, World!");
+    }
+
+    #[test]
+    fn test_body_fixed_length_stream_prefix_exceeds_content_length() {
+        use async_std::io::ReadExt;
+
+        let inner = MockStream::new(b"");
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(b"ABCDEF"),
+            Box::new(inner) as BoxedStream,
+        );
+        let mut stream = BodyFixedLengthStream::new_with_completion_flag(
+            chain,
+            6,
+            Arc::new(AtomicBool::new(false)),
+            "127.0.0.1:8080".parse().unwrap(),
+            false,
+            None,
+        );
+
+        let mut out = Vec::new();
+        async_std::task::block_on(stream.read_to_end(&mut out)).unwrap();
+        assert_eq!(out, b"ABCDEF");
+        assert!(stream.is_fully_consumed());
+    }
+
+    #[test]
+    fn test_body_fixed_length_stream_prefix_large_than_read_buffer() {
+        use async_std::io::ReadExt;
+
+        let prefix_data: Vec<u8> = (0..100).collect();
+        let inner = MockStream::new(b"");
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(&prefix_data),
+            Box::new(inner) as BoxedStream,
+        );
+        let mut stream = BodyFixedLengthStream::new_with_completion_flag(
+            chain,
+            100,
+            Arc::new(AtomicBool::new(false)),
+            "127.0.0.1:8080".parse().unwrap(),
+            false,
+            None,
+        );
+
+        let mut out = Vec::new();
+        let mut small_buf = [0u8; 7];
+        loop {
+            match async_std::task::block_on(stream.read(&mut small_buf)) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&small_buf[..n]),
+                Err(e) => panic!("read error: {e}"),
+            }
+        }
+        assert_eq!(out.len(), 100);
+        assert_eq!(out, prefix_data);
+    }
+
+    #[test]
+    fn test_body_unknown_length_stream_prefix() {
+        use async_std::io::ReadExt;
+
+        let inner = MockStream::new(b"World!");
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(b"Hello, "),
+            Box::new(inner) as BoxedStream,
+        );
+        let mut stream = BodyUnknownLengthStream::new_with_completion_flag(
+            chain,
+            Arc::new(AtomicBool::new(false)),
+            "127.0.0.1:8080".parse().unwrap(),
+            false,
+            None,
+        );
+
+        let mut out = Vec::new();
+        async_std::task::block_on(stream.read_to_end(&mut out)).unwrap();
+        assert_eq!(out, b"Hello, World!");
+    }
+
+    #[test]
+    fn test_body_unknown_length_stream_prefix_only() {
+        use async_std::io::ReadExt;
+
+        let inner = MockStream::new(b"");
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(b"prefix only"),
+            Box::new(inner) as BoxedStream,
+        );
+        let mut stream = BodyUnknownLengthStream::new_with_completion_flag(
+            chain,
+            Arc::new(AtomicBool::new(false)),
+            "127.0.0.1:8080".parse().unwrap(),
+            false,
+            None,
+        );
+
+        let mut out = Vec::new();
+        async_std::task::block_on(stream.read_to_end(&mut out)).unwrap();
+        assert_eq!(out, b"prefix only");
+    }
+
+    #[test]
+    fn test_chunked_decoder_stream_prefix() {
+        use async_std::io::ReadExt;
+
+        // Full chunked: "5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n"
+        // Split on chunk boundary: prefix = "5\r\nHello\r\n", inner = "6\r\n World\r\n0\r\n\r\n"
+        let inner = MockStream::new(b"6\r\n World\r\n0\r\n\r\n");
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(b"5\r\nHello\r\n"),
+            Box::new(inner) as BoxedStream,
+        );
+        let mut stream = ChunkedDecoderStream::new_with_completion_flag(
+            chain,
+            Arc::new(AtomicBool::new(false)),
+            "127.0.0.1:8080".parse().unwrap(),
+            false,
+            None,
+        );
+
+        let mut out = Vec::new();
+        async_std::task::block_on(stream.read_to_end(&mut out)).unwrap();
+        assert_eq!(out, b"Hello World");
+        assert!(stream.is_fully_consumed());
+    }
+
+    #[test]
+    fn test_chunked_decoder_stream_prefix_entire_response() {
+        use async_std::io::ReadExt;
+
+        // All chunked data is in prefix; inner stream is empty (just EOF)
+        let inner = MockStream::new(b"");
+        let chain = crate::stream::ChainRead::new(
+            crate::stream::SliceRead::new(b"5\r\nHello\r\n0\r\n\r\n"),
+            Box::new(inner) as BoxedStream,
+        );
+        let mut stream = ChunkedDecoderStream::new_with_completion_flag(
+            chain,
+            Arc::new(AtomicBool::new(false)),
+            "127.0.0.1:8080".parse().unwrap(),
+            false,
+            None,
+        );
+
+        let mut out = Vec::new();
+        async_std::task::block_on(stream.read_to_end(&mut out)).unwrap();
+        assert_eq!(out, b"Hello");
+        assert!(stream.is_fully_consumed());
     }
 }

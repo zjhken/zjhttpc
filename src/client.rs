@@ -670,7 +670,7 @@ async fn read_headers_to_resp(
     let proxy_used = req.proxy.as_ref().or(client.global_proxy.as_ref()).cloned();
 
     // Read all headers at once (including status line) until \r\n\r\n
-    let all_headers = {
+    let (all_headers, overflow, overflow_len) = {
         let fut = read_until(&mut stream, b"\r\n\r\n");
         let dur = req
             .read_header_timeout
@@ -709,6 +709,7 @@ async fn read_headers_to_resp(
         addr,
         proxy_used,
         read_body_timeout,
+        &overflow[..overflow_len],
     )
     .map_err(|e| anyhow!("{e}"));
 }
@@ -757,26 +758,43 @@ fn parse_resp_first_line(input: &str) -> IResult<&str, (&str, &str, &str, &str, 
 }
 
 // TODO: use nom to parse stream
-pub async fn read_until<S>(stream: &mut S, delimiter: &[u8]) -> Result<Vec<u8>>
+/// Read from stream until delimiter is found. Returns (data, overflow).
+/// Data includes everything up to and including the delimiter.
+/// Overflow contains any bytes read past the delimiter.
+pub async fn read_until<S>(stream: &mut S, delimiter: &[u8]) -> Result<(Vec<u8>, [u8; 4096], usize)>
 where
     S: async_std::io::Read + Unpin + Send + Sync + 'static,
 {
-    let mut buf = Vec::new();
-    let mut one_byte = [0u8; 1];
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+
     if delimiter.is_empty() {
-        return Ok(buf);
+        return Ok((buf, [0u8; 4096], 0));
     }
+
     loop {
-        let read_n = stream.read(&mut one_byte).await.dot()?;
-        if read_n == 0 {
+        let n = stream.read(&mut tmp).await.dot()?;
+        if n == 0 {
             break;
         }
-        buf.push(one_byte[0]);
-        if buf.ends_with(delimiter) {
-            break;
+
+        buf.extend_from_slice(&tmp[..n]);
+
+        // Search the tail that could contain a straddling delimiter
+        let check_start = buf.len().saturating_sub(n + delimiter.len() - 1);
+        if let Some(pos) = buf[check_start..]
+            .windows(delimiter.len())
+            .position(|w| w == delimiter)
+        {
+            let end = check_start + pos + delimiter.len();
+            let overflow_len = buf.len() - end;
+            let mut overflow = [0u8; 4096];
+            overflow[..overflow_len].copy_from_slice(&buf[end..]);
+            buf.truncate(end);
+            return Ok((buf, overflow, overflow_len));
         }
     }
-    Ok(buf)
+    Ok((buf, [0u8; 4096], 0))
 }
 
 pub async fn read_until_v<S>(stream: &mut S, delimiter: &[u8], buf: &mut Vec<u8>) -> Result<usize>
@@ -1082,8 +1100,9 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"Hello World\r\n");
+        assert_eq!(&overflow[..overflow_len], b"");
     }
 
     #[async_std::test]
@@ -1092,8 +1111,9 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"Hello\n");
+        assert_eq!(&overflow[..overflow_len], b"World");
     }
 
     #[async_std::test]
@@ -1102,8 +1122,9 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"");
+        assert_eq!(&overflow[..overflow_len], b"");
     }
 
     #[async_std::test]
@@ -1112,8 +1133,9 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"Hello World");
+        assert_eq!(&overflow[..overflow_len], b"");
     }
 
     #[async_std::test]
@@ -1122,8 +1144,9 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"\r\n");
+        assert_eq!(&overflow[..overflow_len], b"Hello World");
     }
 
     #[async_std::test]
@@ -1132,8 +1155,9 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"");
+        assert_eq!(&overflow[..overflow_len], b"");
     }
 
     #[async_std::test]
@@ -1142,8 +1166,9 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"Line1\r\n");
+        assert_eq!(&overflow[..overflow_len], b"Line2\r\nLine3\r\n");
     }
 
     #[async_std::test]
@@ -1152,8 +1177,9 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"Some data\r\n\r\n");
+        assert_eq!(&overflow[..overflow_len], b"More data");
     }
 
     // ==================== HTTP header tests ====================
@@ -1164,7 +1190,7 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, _, _) = result.unwrap();
         assert_eq!(buf, b"HTTP/1.1 200 OK\r\n");
         let text = std::str::from_utf8(&buf).unwrap();
         assert_eq!(text, "HTTP/1.1 200 OK\r\n");
@@ -1182,7 +1208,7 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
 
         // Verify we got all headers but not the body
@@ -1204,7 +1230,7 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
 
         assert!(text.contains("GET /index.html HTTP/1.1\r\n"));
@@ -1224,7 +1250,7 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
 
         assert!(text.contains("Content-Type: text/html; charset=utf-8\r\n"));
@@ -1244,7 +1270,7 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
 
         assert!(text.contains("HTTP/1.1 200 OK\r\n"));
@@ -1264,7 +1290,7 @@ mod tests {
         let mut cursor = Cursor::new(data_bytes);
         let result = read_until(&mut cursor, b"\r\n\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
 
         assert!(text.contains("HTTP/1.1 200 OK\r\n"));
@@ -1282,7 +1308,7 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
 
         assert!(text.contains("X-Empty-1: \r\n"));
@@ -1303,7 +1329,7 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n\r\n").await;
         assert!(result.is_ok());
-        let buf = result.unwrap();
+        let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
 
         assert!(text.contains("Transfer-Encoding: chunked\r\n"));
