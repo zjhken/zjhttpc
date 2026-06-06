@@ -32,7 +32,13 @@ cargo doc --open               # Generate and view documentation
 
 ### Connection Pooling
 
-A global `DashMap<ConnectionKey, Vec<BoxedStream>>` (`CONNECTION_POOL` in `client.rs`) pools connections keyed by `(SocketAddr, ConnectionType)`. Connections are reused across requests. Pool is capped at 30 streams per key to prevent unbounded growth.
+A per-client `ConnectionPoolInner` (in `client.rs`) pools connections keyed by `(SocketAddr, ConnectionType)` in a `DashMap`. Each entry tracks `PooledConnection { stream, returned_at: Instant }` for idle eviction. The pool enforces:
+- **Per-key limit**: max connections per `(addr, connection_type)` (default 30)
+- **Global limit**: max total connections across all keys (default 1000)
+- **Idle timeout**: connections older than the timeout are discarded on pick/return (default 90s)
+- **Empty entry cleanup**: DashMap entries are removed when their Vec is drained
+
+Pool config is set via `ZJHttpClient::set_pool_config(max_per_key, max_total, idle_timeout)`. The pool is self-contained (config travels with the Arc), so Response and stream wrappers only need the pool reference.
 
 ### Stream Abstraction
 

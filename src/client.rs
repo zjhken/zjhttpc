@@ -17,8 +17,11 @@ use nom::{
 use rustls_native_certs::load_native_certs;
 use std::{
     net::SocketAddr,
-    sync::Arc,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -53,10 +56,143 @@ pub(crate) struct ConnectionKey {
     pub(crate) connection_type: ConnectionType,
 }
 
-/// Per-client connection pool
-pub(crate) type ConnectionPool = Arc<DashMap<ConnectionKey, Vec<BoxedStream>>>;
+/// A pooled connection with metadata for idle eviction.
+pub(crate) struct PooledConnection {
+    pub stream: BoxedStream,
+    pub returned_at: Instant,
+}
+
+/// Thread-safe connection pool with per-key and global limits plus idle eviction.
+pub(crate) struct ConnectionPoolInner {
+    map: DashMap<ConnectionKey, Vec<PooledConnection>>,
+    total_count: AtomicUsize,
+    max_per_key: usize,
+    max_total: usize,
+    idle_timeout: Duration,
+}
+
+impl ConnectionPoolInner {
+    pub fn new(max_per_key: usize, max_total: usize, idle_timeout: Duration) -> Self {
+        Self {
+            map: DashMap::new(),
+            total_count: AtomicUsize::new(0),
+            max_per_key,
+            max_total,
+            idle_timeout,
+        }
+    }
+
+    /// Pick a non-idle connection for the given key. Discards expired connections
+    /// and removes empty entries. Returns None if no usable connection exists.
+    pub fn pick(&self, key: &ConnectionKey) -> Option<BoxedStream> {
+        let mut entry = match self.map.get_mut(key) {
+            Some(e) => e,
+            None => return None,
+        };
+        let pool = entry.value_mut();
+        while let Some(conn) = pool.pop() {
+            if conn.returned_at.elapsed() < self.idle_timeout {
+                self.total_count.fetch_sub(1, Ordering::Relaxed);
+                let is_empty = pool.is_empty();
+                drop(entry);
+                if is_empty {
+                    self.map.remove(key);
+                }
+                return Some(conn.stream);
+            }
+            self.total_count.fetch_sub(1, Ordering::Relaxed);
+            trace!(key = ?(&key.addr, &key.connection_type), "discarded idle connection");
+        }
+        drop(entry);
+        self.map.remove(key);
+        None
+    }
+
+    /// Return a stream to the pool. Enforces both per-key and global limits.
+    /// Cleans up idle connections for this key as a side effect.
+    pub fn return_stream(&self, stream: BoxedStream, stream_info: StreamInfo) {
+        let key = build_connection_key(&stream_info);
+
+        // Evict idle connections for this key
+        self.evict_idle_for_key(&key);
+
+        // Check global limit
+        if self.total_count.load(Ordering::Relaxed) >= self.max_total {
+            trace!(key = ?(&key.addr, &key.connection_type), "global pool full, dropping stream");
+            return;
+        }
+
+        use dashmap::mapref::entry::Entry;
+        match self.map.entry(key.clone()) {
+            Entry::Occupied(mut entry) => {
+                let pool = entry.get_mut();
+                if pool.len() < self.max_per_key {
+                    pool.push(PooledConnection {
+                        stream,
+                        returned_at: Instant::now(),
+                    });
+                    self.total_count.fetch_add(1, Ordering::Relaxed);
+                    trace!(key = ?(&key.addr, &key.connection_type), len = pool.len(), "stream returned to pool");
+                } else {
+                    trace!(key = ?(&key.addr, &key.connection_type), len = pool.len(), "per-key pool full");
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(vec![PooledConnection {
+                    stream,
+                    returned_at: Instant::now(),
+                }]);
+                self.total_count.fetch_add(1, Ordering::Relaxed);
+                trace!(key = ?(&key.addr, &key.connection_type), "add new vec to pool");
+            }
+        }
+    }
+
+    /// Remove expired connections for a given key and adjust total_count.
+    fn evict_idle_for_key(&self, key: &ConnectionKey) {
+        if let Some(mut entry) = self.map.get_mut(key) {
+            let pool = entry.value_mut();
+            let before = pool.len();
+            pool.retain(|conn| conn.returned_at.elapsed() < self.idle_timeout);
+            let evicted = before - pool.len();
+            if evicted > 0 {
+                self.total_count.fetch_sub(evicted, Ordering::Relaxed);
+                trace!(key = ?(&key.addr, &key.connection_type), evicted, "evicted idle connections");
+            }
+        }
+    }
+}
+
+/// Build a ConnectionKey from StreamInfo.
+fn build_connection_key(stream_info: &StreamInfo) -> ConnectionKey {
+    if let Some(proxy) = &stream_info.proxy_used {
+        match proxy.url.scheme() {
+            "https" => ConnectionKey {
+                addr: proxy.addr,
+                connection_type: ConnectionType::ProxyTls(proxy.addr),
+            },
+            _ => ConnectionKey {
+                addr: proxy.addr,
+                connection_type: ConnectionType::ProxyTcp(proxy.addr),
+            },
+        }
+    } else if stream_info.is_tls {
+        ConnectionKey {
+            addr: stream_info.addr,
+            connection_type: ConnectionType::DirectTls,
+        }
+    } else {
+        ConnectionKey {
+            addr: stream_info.addr,
+            connection_type: ConnectionType::DirectTcp,
+        }
+    }
+}
+
+pub(crate) type ConnectionPool = Arc<ConnectionPoolInner>;
 
 /// Connection metadata for returning streams to the appropriate pool
+#[derive(Clone)]
 pub(crate) struct StreamInfo {
     /// The socket address of the remote server
     pub addr: SocketAddr,
@@ -84,10 +220,8 @@ pub struct ZJHttpClient {
     pub global_proxy: Option<HttpsProxyOption>,
     #[builder(default = "64 * 1024")]
     pub global_max_header_bytes: usize,
-    #[builder(default = "Arc::new(DashMap::new())")]
+    #[builder(default = "Arc::new(ConnectionPoolInner::new(30, 1000, Duration::from_secs(90)))")]
     pub(crate) connection_pool: ConnectionPool,
-    #[builder(default = 30)]
-    pub pool_max_per_key: usize,
 }
 
 impl std::fmt::Debug for ZJHttpClient {
@@ -100,8 +234,9 @@ impl std::fmt::Debug for ZJHttpClient {
             .field("global_trust_store_pem", &self.global_trust_store_pem)
             .field("global_proxy", &self.global_proxy)
             .field("global_max_header_bytes", &self.global_max_header_bytes)
-            .field("connection_pool", &format!("<pool with {} entries>", self.connection_pool.len()))
-            .field("pool_max_per_key", &self.pool_max_per_key)
+            .field("connection_pool", &format!("<pool with {} entries, {} connections>",
+                self.connection_pool.map.len(),
+                self.connection_pool.total_count.load(Ordering::Relaxed)))
             .finish()
     }
 }
@@ -117,8 +252,7 @@ impl ZJHttpClient {
             global_trust_store_pem: None,
             global_proxy: None,
             global_max_header_bytes: Some(64 * 1024),
-            connection_pool: Some(Arc::new(DashMap::new())),
-            pool_max_per_key: Some(30),
+            connection_pool: Some(Arc::new(ConnectionPoolInner::new(30, 1000, Duration::from_secs(90)))),
         }
     }
 
@@ -135,6 +269,11 @@ impl ZJHttpClient {
 
     pub fn set_connect_timeout(mut self, timeout: Duration) -> Self {
         self.global_connect_timeout = timeout;
+        self
+    }
+
+    pub fn set_pool_config(mut self, max_per_key: usize, max_total: usize, idle_timeout: Duration) -> Self {
+        self.connection_pool = Arc::new(ConnectionPoolInner::new(max_per_key, max_total, idle_timeout));
         self
     }
 
@@ -353,12 +492,8 @@ async fn connect_fresh_tls(
     Ok(Box::new(tls_stream))
 }
 
-/// Try to pick a stream from the connection pool.
-/// Returns None if the pool is empty for this key.
-/// Does not pre-validate stream health — stale connections will fail naturally
-/// during the next read/write, at which point the caller can retry with a fresh connection.
 fn try_pick_from_pool(pool: &ConnectionPool, key: &ConnectionKey) -> Option<BoxedStream> {
-    pool.get_mut(key).and_then(|mut pool| pool.pop())
+    pool.pick(key)
 }
 
 async fn resolve_1st_ip(req: &mut Request) -> Result<SocketAddr> {
@@ -746,7 +881,6 @@ async fn read_headers_to_resp(
         read_body_timeout,
         &overflow[..overflow_len],
         Some(client.connection_pool.clone()),
-        client.pool_max_per_key,
     )
     .map_err(|e| anyhow!("{e}"));
 }
@@ -848,58 +982,6 @@ where
     }
 }
 
-
-/// Return a stream to the appropriate connection pool based on its metadata
-///
-/// This is the preferred way to return streams to the pool as it doesn't require
-/// creating a temporary Response object.
-pub(crate) fn return_stream_to_pool(pool: &ConnectionPool, stream: BoxedStream, stream_info: StreamInfo, max_per_key: usize) {
-    // Build the appropriate key based on connection metadata
-    let key = if let Some(proxy) = &stream_info.proxy_used {
-        // Proxy connection
-        match proxy.url.scheme() {
-            "https" => ConnectionKey {
-                addr: proxy.addr,
-                connection_type: ConnectionType::ProxyTls(proxy.addr),
-            },
-            _ => ConnectionKey {
-                addr: proxy.addr,
-                connection_type: ConnectionType::ProxyTcp(proxy.addr),
-            },
-        }
-    } else {
-        // Direct connection
-        if stream_info.is_tls {
-            ConnectionKey {
-                addr: stream_info.addr,
-                connection_type: ConnectionType::DirectTls,
-            }
-        } else {
-            ConnectionKey {
-                addr: stream_info.addr,
-                connection_type: ConnectionType::DirectTcp,
-            }
-        }
-    };
-
-    // Return stream to the unified pool
-    use dashmap::mapref::entry::Entry;
-    match pool.entry(key.clone()) {
-        Entry::Occupied(mut entry) => {
-            let pool = entry.get_mut();
-            if pool.len() <= max_per_key {
-                pool.push(stream);
-                trace!(key = ?(&key.addr, &key.connection_type), len = pool.len(), "stream returned to pool");
-            } else {
-                trace!(key = ?(&key.addr, &key.connection_type), len = pool.len(), "pool is full");
-            }
-        }
-        Entry::Vacant(entry) => {
-            entry.insert(vec![stream]);
-            trace!(key = ?(&key.addr, &key.connection_type), "add new vec to pool");
-        }
-    }
-}
 
 pub enum HttpVersion {
     V1_1,
@@ -1335,6 +1417,174 @@ mod tests {
         assert!(text.ends_with("\r\n\r\n"));
         // Should not include the chunked body
         assert!(!text.contains("5\r\n"));
+    }
+
+    // ==================== Connection pool tests ====================
+
+    struct MockStream {
+        data: Vec<u8>,
+        pos: usize,
+    }
+    impl MockStream {
+        fn new(data: &[u8]) -> Self {
+            Self { data: data.to_vec(), pos: 0 }
+        }
+    }
+    impl async_std::io::Read for MockStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let n = std::cmp::min(buf.len(), self.data.len() - self.pos);
+            if n == 0 { return std::task::Poll::Ready(Ok(0)); }
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(n))
+        }
+    }
+    impl async_std::io::Write for MockStream {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>, _buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(0))
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+        fn poll_close(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+    }
+    impl crate::stream::RWStream for MockStream {}
+
+    fn make_stream() -> BoxedStream {
+        Box::new(MockStream::new(b"test"))
+    }
+
+    fn make_key() -> ConnectionKey {
+        ConnectionKey {
+            addr: "127.0.0.1:8080".parse().unwrap(),
+            connection_type: ConnectionType::DirectTcp,
+        }
+    }
+
+    fn make_stream_info() -> StreamInfo {
+        StreamInfo {
+            addr: "127.0.0.1:8080".parse().unwrap(),
+            is_tls: false,
+            proxy_used: None,
+        }
+    }
+
+    #[test]
+    fn test_pool_per_key_limit() {
+        let pool = ConnectionPoolInner::new(2, 100, Duration::from_secs(90));
+        let key = make_key();
+        let info = make_stream_info();
+
+        pool.return_stream(make_stream(), info.clone());
+        pool.return_stream(make_stream(), info.clone());
+        pool.return_stream(make_stream(), info.clone()); // should be dropped
+
+        assert_eq!(pool.total_count.load(Ordering::Relaxed), 2);
+        assert_eq!(pool.map.get(&key).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_pool_global_limit() {
+        let pool = ConnectionPoolInner::new(30, 2, Duration::from_secs(90));
+        let info = make_stream_info();
+
+        pool.return_stream(make_stream(), info.clone());
+        pool.return_stream(make_stream(), info.clone());
+        pool.return_stream(make_stream(), info.clone()); // should be dropped (global limit)
+
+        assert_eq!(pool.total_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_pool_pick_returns_stream() {
+        let pool = ConnectionPoolInner::new(30, 100, Duration::from_secs(90));
+        let key = make_key();
+        let info = make_stream_info();
+
+        pool.return_stream(make_stream(), info);
+        let stream = pool.pick(&key);
+        assert!(stream.is_some());
+        assert_eq!(pool.total_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_pool_pick_returns_none_when_empty() {
+        let pool = ConnectionPoolInner::new(30, 100, Duration::from_secs(90));
+        let key = make_key();
+        assert!(pool.pick(&key).is_none());
+    }
+
+    #[test]
+    fn test_pool_empty_entry_cleanup() {
+        let pool = ConnectionPoolInner::new(30, 100, Duration::from_secs(90));
+        let key = make_key();
+        let info = make_stream_info();
+
+        pool.return_stream(make_stream(), info);
+        assert!(pool.map.contains_key(&key));
+
+        pool.pick(&key);
+        assert!(!pool.map.contains_key(&key));
+    }
+
+    #[test]
+    fn test_pool_idle_eviction_on_return() {
+        let pool = ConnectionPoolInner::new(30, 100, Duration::from_millis(1));
+        let key = make_key();
+        let info = make_stream_info();
+
+        pool.return_stream(make_stream(), info.clone());
+
+        // Insert a stale entry directly to simulate aging
+        {
+            let mut entry = pool.map.get_mut(&key).unwrap();
+            let conn = entry.value_mut().first_mut().unwrap();
+            conn.returned_at = Instant::now() - Duration::from_secs(10);
+        }
+
+        // Returning a new stream should evict the stale one
+        pool.return_stream(make_stream(), info);
+        assert_eq!(pool.total_count.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.map.get(&key).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_pool_idle_eviction_on_pick() {
+        let pool = ConnectionPoolInner::new(30, 100, Duration::from_millis(1));
+        let key = make_key();
+        let info = make_stream_info();
+
+        pool.return_stream(make_stream(), info);
+
+        // Make the connection appear old
+        {
+            let mut entry = pool.map.get_mut(&key).unwrap();
+            let conn = entry.value_mut().first_mut().unwrap();
+            conn.returned_at = Instant::now() - Duration::from_secs(10);
+        }
+
+        // Pick should return None (connection evicted as idle)
+        let stream = pool.pick(&key);
+        assert!(stream.is_none());
+        assert!(!pool.map.contains_key(&key));
+    }
+
+    #[test]
+    fn test_set_pool_config() {
+        let client = ZJHttpClient::builder()
+            .build()
+            .unwrap();
+        let client = client.set_pool_config(10, 200, Duration::from_secs(30));
+        // Verify pool works with new config
+        let info = make_stream_info();
+        for _ in 0..10 {
+            client.connection_pool.return_stream(make_stream(), info.clone());
+        }
+        // 11th should be dropped (per-key limit = 10)
+        client.connection_pool.return_stream(make_stream(), info);
+        assert_eq!(client.connection_pool.total_count.load(Ordering::Relaxed), 10);
     }
 
 }
