@@ -222,6 +222,8 @@ pub struct ZJHttpClient {
     pub global_max_header_bytes: usize,
     #[builder(default = "Arc::new(ConnectionPoolInner::new(30, 1000, Duration::from_secs(90)))")]
     pub(crate) connection_pool: ConnectionPool,
+    #[builder(default)]
+    pub(crate) tls_config: std::sync::OnceLock<Arc<rustls::ClientConfig>>,
 }
 
 impl std::fmt::Debug for ZJHttpClient {
@@ -237,6 +239,7 @@ impl std::fmt::Debug for ZJHttpClient {
             .field("connection_pool", &format!("<pool with {} entries, {} connections>",
                 self.connection_pool.map.len(),
                 self.connection_pool.total_count.load(Ordering::Relaxed)))
+            .field("tls_config", &"OnceLock<Arc<ClientConfig>>")
             .finish()
     }
 }
@@ -253,7 +256,14 @@ impl ZJHttpClient {
             global_proxy: None,
             global_max_header_bytes: Some(64 * 1024),
             connection_pool: Some(Arc::new(ConnectionPoolInner::new(30, 1000, Duration::from_secs(90)))),
+            tls_config: Some(std::sync::OnceLock::new()),
         }
+    }
+
+    pub(crate) fn tls_config(&self) -> Arc<rustls::ClientConfig> {
+        self.tls_config.get_or_init(|| {
+            Arc::new(create_tls_config(&self.global_trust_store_pem).expect("failed to create TLS config"))
+        }).clone()
     }
 
     pub fn set_proxy(mut self, proxy: HttpsProxyOption) -> Self {
@@ -468,8 +478,12 @@ async fn connect_fresh_tls(
     addr: &SocketAddr,
 ) -> Result<BoxedStream> {
     let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
-    let tls_config = create_tls_config(&client.global_trust_store_pem).dot()?;
-    let tls_connector: TlsConnector = Arc::new(tls_config).into();
+    let tls_config = if req.trust_store_pem.is_some() {
+        Arc::new(create_tls_config(&req.trust_store_pem).dot()?)
+    } else {
+        client.tls_config()
+    };
+    let tls_connector: TlsConnector = tls_config.into();
     let host = match req.url.host() {
         Some(url::Host::Domain(s)) => s,
         _ => {
