@@ -31,6 +31,7 @@ pub struct ChunkedDecoderStream {
     is_tls: bool,
     proxy_used: Option<HttpsProxyOption>,
     pool: Option<ConnectionPool>,
+    pool_max_per_key: usize,
 }
 
 /// A fixed-length stream that tracks remaining bytes and returns 0 when complete
@@ -42,6 +43,7 @@ pub struct BodyFixedLengthStream {
     is_tls: bool,
     proxy_used: Option<HttpsProxyOption>,
     pool: Option<ConnectionPool>,
+    pool_max_per_key: usize,
 }
 
 /// A stream wrapper for responses with unknown length that returns the stream to pool when EOF is reached
@@ -52,6 +54,7 @@ pub struct BodyUnknownLengthStream {
     is_tls: bool,
     proxy_used: Option<HttpsProxyOption>,
     pool: Option<ConnectionPool>,
+    pool_max_per_key: usize,
 }
 
 type ChainedInner = ChainRead<SliceRead, BoxedStream>;
@@ -78,6 +81,7 @@ impl ChunkedDecoderStream {
             is_tls: false,
             proxy_used: None,
             pool: None,
+            pool_max_per_key: 30,
         }
     }
 
@@ -88,6 +92,7 @@ impl ChunkedDecoderStream {
         is_tls: bool,
         proxy_used: Option<HttpsProxyOption>,
         pool: Option<ConnectionPool>,
+        pool_max_per_key: usize,
     ) -> Self {
         Self {
             inner: Some(inner),
@@ -100,6 +105,7 @@ impl ChunkedDecoderStream {
             is_tls,
             proxy_used,
             pool,
+            pool_max_per_key,
         }
     }
 
@@ -116,7 +122,7 @@ impl ChunkedDecoderStream {
                 is_tls: self.is_tls,
                 proxy_used: self.proxy_used.clone(),
             };
-            return_stream_to_pool(pool, stream, stream_info);
+            return_stream_to_pool(pool, stream, stream_info, self.pool_max_per_key);
         }
     }
 
@@ -339,6 +345,7 @@ impl BodyFixedLengthStream {
             is_tls: false,
             proxy_used: None,
             pool: None,
+            pool_max_per_key: 30,
         }
     }
 
@@ -350,6 +357,7 @@ impl BodyFixedLengthStream {
         is_tls: bool,
         proxy_used: Option<HttpsProxyOption>,
         pool: Option<ConnectionPool>,
+        pool_max_per_key: usize,
     ) -> Self {
         Self {
             inner: Some(inner),
@@ -359,6 +367,7 @@ impl BodyFixedLengthStream {
             is_tls,
             proxy_used,
             pool,
+            pool_max_per_key,
         }
     }
 
@@ -374,7 +383,7 @@ impl BodyFixedLengthStream {
                 is_tls: self.is_tls,
                 proxy_used: self.proxy_used.clone(),
             };
-            return_stream_to_pool(pool, stream, stream_info);
+            return_stream_to_pool(pool, stream, stream_info, self.pool_max_per_key);
         }
     }
 }
@@ -439,6 +448,7 @@ impl BodyUnknownLengthStream {
         is_tls: bool,
         proxy_used: Option<HttpsProxyOption>,
         pool: Option<ConnectionPool>,
+        pool_max_per_key: usize,
     ) -> Self {
         Self {
             inner: Some(inner),
@@ -447,6 +457,7 @@ impl BodyUnknownLengthStream {
             is_tls,
             proxy_used,
             pool,
+            pool_max_per_key,
         }
     }
 
@@ -462,7 +473,7 @@ impl BodyUnknownLengthStream {
                 is_tls: self.is_tls,
                 proxy_used: self.proxy_used.clone(),
             };
-            return_stream_to_pool(pool, stream, stream_info);
+            return_stream_to_pool(pool, stream, stream_info, self.pool_max_per_key);
         }
     }
 }
@@ -519,6 +530,7 @@ pub struct Response {
     pub read_body_timeout: Option<std::time::Duration>,
     /// Connection pool to return streams to
     pool: Option<ConnectionPool>,
+    pool_max_per_key: usize,
 }
 
 impl Drop for Response {
@@ -531,7 +543,7 @@ impl Drop for Response {
                 is_tls: self.is_tls,
                 proxy_used: self.proxy_used.clone(),
             };
-            return_stream_to_pool(pool, stream, stream_info);
+            return_stream_to_pool(pool, stream, stream_info, self.pool_max_per_key);
         }
     }
 }
@@ -548,6 +560,7 @@ impl Response {
         read_body_timeout: Option<std::time::Duration>,
         body_prefix: &[u8],
         pool: Option<ConnectionPool>,
+        pool_max_per_key: usize,
     ) -> Result<Self, ZjhttpcError> {
         let http_version = match http_version {
             "1.1" => HttpVersion::V1_1,
@@ -586,6 +599,7 @@ impl Response {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout,
             pool,
+            pool_max_per_key,
         };
         return Ok(resp);
     }
@@ -725,6 +739,7 @@ impl Response {
                     self.is_tls,
                     self.proxy_used.clone(),
                     pool,
+                    self.pool_max_per_key,
                 );
                 Some(Box::new(decoder) as crate::stream::ReadStream)
             } else if let Some(length) = content_length {
@@ -740,6 +755,7 @@ impl Response {
                     self.is_tls,
                     self.proxy_used.clone(),
                     pool,
+                    self.pool_max_per_key,
                 );
                 Some(Box::new(fixed_length_stream) as crate::stream::ReadStream)
             } else {
@@ -754,6 +770,7 @@ impl Response {
                     self.is_tls,
                     self.proxy_used.clone(),
                     pool,
+                    self.pool_max_per_key,
                 );
                 Some(Box::new(unknown_length_stream) as crate::stream::ReadStream)
             }
@@ -1250,6 +1267,7 @@ mod tests {
             false,
             None,
             None,
+            30,
         );
 
         // Read all data
@@ -1366,6 +1384,7 @@ mod tests {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
             pool: None,
+            pool_max_per_key: 30,
         };
 
         // Test initial state
@@ -1393,6 +1412,7 @@ mod tests {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
             pool: None,
+            pool_max_per_key: 30,
         };
 
         // Initially not complete
@@ -1427,6 +1447,7 @@ mod tests {
             body_completion_flag: completion_flag.clone(),
             read_body_timeout: None,
             pool: None,
+            pool_max_per_key: 30,
         };
 
         // Initially not complete
@@ -1608,6 +1629,7 @@ mod tests {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
             pool: None,
+            pool_max_per_key: 30,
         };
 
         // Test body_bytes method
@@ -1706,6 +1728,7 @@ mod tests {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
             pool: None,
+            pool_max_per_key: 30,
         };
 
         // Test body_json method
@@ -1802,6 +1825,7 @@ mod tests {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
             pool: None,
+            pool_max_per_key: 30,
         };
 
         // Test body_json method with invalid JSON
@@ -1863,6 +1887,7 @@ mod tests {
             false,
             None,
             None,
+            30,
         );
 
         let mut out = Vec::new();
@@ -1887,6 +1912,7 @@ mod tests {
             false,
             None,
             None,
+            30,
         );
 
         let mut out = Vec::new();
@@ -1913,6 +1939,7 @@ mod tests {
             false,
             None,
             None,
+            30,
         );
 
         let mut out = Vec::new();
@@ -1944,6 +1971,7 @@ mod tests {
             false,
             None,
             None,
+            30,
         );
 
         let mut out = Vec::new();
@@ -1967,6 +1995,7 @@ mod tests {
             false,
             None,
             None,
+            30,
         );
 
         let mut out = Vec::new();
@@ -1992,6 +2021,7 @@ mod tests {
             false,
             None,
             None,
+            30,
         );
 
         let mut out = Vec::new();
@@ -2017,6 +2047,7 @@ mod tests {
             false,
             None,
             None,
+            30,
         );
 
         let mut out = Vec::new();

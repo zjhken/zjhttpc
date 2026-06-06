@@ -86,6 +86,8 @@ pub struct ZJHttpClient {
     pub global_max_header_bytes: usize,
     #[builder(default = "Arc::new(DashMap::new())")]
     pub(crate) connection_pool: ConnectionPool,
+    #[builder(default = 30)]
+    pub pool_max_per_key: usize,
 }
 
 impl std::fmt::Debug for ZJHttpClient {
@@ -99,6 +101,7 @@ impl std::fmt::Debug for ZJHttpClient {
             .field("global_proxy", &self.global_proxy)
             .field("global_max_header_bytes", &self.global_max_header_bytes)
             .field("connection_pool", &format!("<pool with {} entries>", self.connection_pool.len()))
+            .field("pool_max_per_key", &self.pool_max_per_key)
             .finish()
     }
 }
@@ -115,6 +118,7 @@ impl ZJHttpClient {
             global_proxy: None,
             global_max_header_bytes: Some(64 * 1024),
             connection_pool: Some(Arc::new(DashMap::new())),
+            pool_max_per_key: Some(30),
         }
     }
 
@@ -742,6 +746,7 @@ async fn read_headers_to_resp(
         read_body_timeout,
         &overflow[..overflow_len],
         Some(client.connection_pool.clone()),
+        client.pool_max_per_key,
     )
     .map_err(|e| anyhow!("{e}"));
 }
@@ -848,7 +853,7 @@ where
 ///
 /// This is the preferred way to return streams to the pool as it doesn't require
 /// creating a temporary Response object.
-pub(crate) fn return_stream_to_pool(pool: &ConnectionPool, stream: BoxedStream, stream_info: StreamInfo) {
+pub(crate) fn return_stream_to_pool(pool: &ConnectionPool, stream: BoxedStream, stream_info: StreamInfo, max_per_key: usize) {
     // Build the appropriate key based on connection metadata
     let key = if let Some(proxy) = &stream_info.proxy_used {
         // Proxy connection
@@ -882,7 +887,7 @@ pub(crate) fn return_stream_to_pool(pool: &ConnectionPool, stream: BoxedStream, 
     match pool.entry(key.clone()) {
         Entry::Occupied(mut entry) => {
             let pool = entry.get_mut();
-            if pool.len() <= 30 {
+            if pool.len() <= max_per_key {
                 pool.push(stream);
                 trace!(key = ?(&key.addr, &key.connection_type), len = pool.len(), "stream returned to pool");
             } else {
