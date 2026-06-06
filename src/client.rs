@@ -84,6 +84,8 @@ pub struct ZJHttpClient {
     pub global_trust_store_pem: Option<TrustStorePem>,
     #[builder(default)]
     pub global_proxy: Option<HttpsProxyOption>,
+    #[builder(default = "64 * 1024")]
+    pub global_max_header_bytes: usize,
 }
 
 impl ZJHttpClient {
@@ -96,6 +98,7 @@ impl ZJHttpClient {
             global_connect_timeout: Some(Duration::from_secs(3)),
             global_trust_store_pem: None,
             global_proxy: None,
+            global_max_header_bytes: Some(64 * 1024),
         }
     }
 
@@ -683,7 +686,7 @@ async fn read_headers_to_resp(
 
     // Read all headers at once (including status line) until \r\n\r\n
     let (all_headers, overflow, overflow_len) = {
-        let fut = read_until(&mut stream, b"\r\n\r\n");
+        let fut = read_until(&mut stream, b"\r\n\r\n", client.global_max_header_bytes);
         let dur = req
             .read_header_timeout
             .unwrap_or(client.global_read_header_timeout);
@@ -773,7 +776,11 @@ fn parse_resp_first_line(input: &str) -> IResult<&str, (&str, &str, &str, &str, 
 /// Read from stream until delimiter is found. Returns (data, overflow).
 /// Data includes everything up to and including the delimiter.
 /// Overflow contains any bytes read past the delimiter.
-pub async fn read_until<S>(stream: &mut S, delimiter: &[u8]) -> Result<(Vec<u8>, [u8; 4096], usize)>
+pub async fn read_until<S>(
+    stream: &mut S,
+    delimiter: &[u8],
+    max_bytes: usize,
+) -> Result<(Vec<u8>, [u8; 4096], usize)>
 where
     S: async_std::io::Read + Unpin + Send + Sync + 'static,
 {
@@ -795,6 +802,14 @@ where
 
         buf.extend_from_slice(&tmp[..n]);
 
+        if buf.len() > max_bytes {
+            return Err(anyhow!(
+                "read_until exceeded max_bytes limit ({} > {})",
+                buf.len(),
+                max_bytes
+            ));
+        }
+
         // Search the tail that could contain a straddling delimiter
         let check_start = buf.len().saturating_sub(n + delimiter.len() - 1);
         if let Some(pos) = buf[check_start..]
@@ -811,29 +826,6 @@ where
     }
 }
 
-pub async fn read_until_v<S>(stream: &mut S, delimiter: &[u8], buf: &mut Vec<u8>) -> Result<usize>
-where
-    S: async_std::io::Read + Unpin + Send + Sync + 'static,
-{
-    buf.clear();
-    let mut one_byte = [0u8; 1];
-    let mut n = 0usize;
-    if delimiter.is_empty() {
-        return Err(anyhow!("delemeter should not be empty"));
-    }
-    loop {
-        let read_n = stream.read(&mut one_byte).await.dot()?;
-        if read_n == 0 {
-            break;
-        }
-        buf.push(one_byte[0]);
-        n += 1;
-        if buf.ends_with(delimiter) {
-            break;
-        }
-    }
-    Ok(n)
-}
 
 /// Return a stream to the appropriate connection pool based on its metadata
 ///
@@ -1112,7 +1104,7 @@ mod tests {
     async fn test_read_until_basic() {
         let data = b"Hello World\r\n";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"Hello World\r\n");
@@ -1123,7 +1115,7 @@ mod tests {
     async fn test_read_until_single_char_delimiter() {
         let data = b"Hello\nWorld";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\n").await;
+        let result = read_until(&mut cursor, b"\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"Hello\n");
@@ -1134,7 +1126,7 @@ mod tests {
     async fn test_read_until_empty_delimiter() {
         let data = b"Hello World";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"").await;
+        let result = read_until(&mut cursor, b"", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"");
@@ -1145,7 +1137,7 @@ mod tests {
     async fn test_read_until_no_delimiter_found() {
         let data = b"Hello World";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n", 1024 * 1024).await;
         assert!(result.is_err());
     }
 
@@ -1153,7 +1145,7 @@ mod tests {
     async fn test_read_until_delimiter_at_start() {
         let data = b"\r\nHello World";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"\r\n");
@@ -1164,7 +1156,7 @@ mod tests {
     async fn test_read_until_empty_stream() {
         let data = b"";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n", 1024 * 1024).await;
         assert!(result.is_err());
     }
 
@@ -1172,7 +1164,7 @@ mod tests {
     async fn test_read_until_multiple_delimiters() {
         let data = b"Line1\r\nLine2\r\nLine3\r\n";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"Line1\r\n");
@@ -1183,7 +1175,7 @@ mod tests {
     async fn test_read_until_long_delimiter() {
         let data = b"Some data\r\n\r\nMore data";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, overflow, overflow_len) = result.unwrap();
         assert_eq!(buf, b"Some data\r\n\r\n");
@@ -1196,7 +1188,7 @@ mod tests {
     async fn test_read_until_http_response_first_line() {
         let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, _, _) = result.unwrap();
         assert_eq!(buf, b"HTTP/1.1 200 OK\r\n");
@@ -1214,7 +1206,7 @@ mod tests {
                      \r\n\
                      {\"message\": \"body\"}";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
@@ -1236,7 +1228,7 @@ mod tests {
                      Accept: */*\r\n\
                      \r\n";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
@@ -1256,7 +1248,7 @@ mod tests {
                      Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\r\n\
                      \r\n";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
@@ -1276,7 +1268,7 @@ mod tests {
                       line2\r\n\
                      \r\n";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
@@ -1296,7 +1288,7 @@ mod tests {
 
         let data_bytes = data.into_bytes();
         let mut cursor = Cursor::new(data_bytes);
-        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
@@ -1314,7 +1306,7 @@ mod tests {
                      X-Empty-2: \r\n\
                      \r\n";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
@@ -1335,7 +1327,7 @@ mod tests {
                      0\r\n\
                      \r\n";
         let mut cursor = Cursor::new(data);
-        let result = read_until(&mut cursor, b"\r\n\r\n").await;
+        let result = read_until(&mut cursor, b"\r\n\r\n", 1024 * 1024).await;
         assert!(result.is_ok());
         let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
@@ -1346,43 +1338,4 @@ mod tests {
         assert!(!text.contains("5\r\n"));
     }
 
-    // ==================== read_until_v tests ====================
-
-    #[async_std::test]
-    async fn test_read_until_v_basic() {
-        let data = b"Hello World\r\n";
-        let mut cursor = Cursor::new(data);
-        let mut buf = Vec::new();
-        let result = read_until_v(&mut cursor, b"\r\n", &mut buf).await;
-        assert!(result.is_ok());
-        let n = result.unwrap();
-        assert_eq!(n, 13); // "Hello World\r\n".len()
-        assert_eq!(buf, b"Hello World\r\n");
-    }
-
-    #[async_std::test]
-    async fn test_read_until_v_reuse_buffer() {
-        let data1 = b"First\r\n";
-        let data2 = b"Second\r\n";
-
-        let mut cursor = Cursor::new(data1);
-        let mut buf = Vec::new();
-        let result1 = read_until_v(&mut cursor, b"\r\n", &mut buf).await;
-        assert!(result1.is_ok());
-        assert_eq!(buf, b"First\r\n");
-
-        let mut cursor = Cursor::new(data2);
-        let result2 = read_until_v(&mut cursor, b"\r\n", &mut buf).await;
-        assert!(result2.is_ok());
-        assert_eq!(buf, b"Second\r\n");
-    }
-
-    #[async_std::test]
-    async fn test_read_until_v_empty_delimiter() {
-        let data = b"Hello World";
-        let mut cursor = Cursor::new(data);
-        let mut buf = Vec::new();
-        let result = read_until_v(&mut cursor, b"", &mut buf).await;
-        assert!(result.is_err());
-    }
 }
