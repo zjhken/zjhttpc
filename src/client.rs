@@ -582,7 +582,6 @@ where
             stream.write_all(b"?").await.dot()?;
             stream.write_all(q.as_bytes()).await.dot()?;
         }
-        // TODO: maybe need to handle segements like "#a=b"
         stream.write_all(b" ").await.dot()?;
         stream.write_all(b"HTTP/1.1\r\n").await.dot()?;
         // insert headers
