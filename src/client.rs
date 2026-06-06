@@ -587,14 +587,12 @@ where
         stream.write_all(b"HTTP/1.1\r\n").await.dot()?;
         // insert headers
         for (key, values) in &req.headers {
-            stream.write_all(key.as_bytes()).await.dot()?;
-            stream.write_all(b": ").await.dot()?;
-            // TODO: handle multi same key headers
-            stream
-                .write_all(values.first().unwrap().as_bytes())
-                .await
-                .dot()?;
-            stream.write_all(b"\r\n").await.dot()?;
+            for value in values {
+                stream.write_all(key.as_bytes()).await.dot()?;
+                stream.write_all(b": ").await.dot()?;
+                stream.write_all(value.as_bytes()).await.dot()?;
+                stream.write_all(b"\r\n").await.dot()?;
+            }
         }
         // Write Content-Type if set and user hasn't manually set it in headers
         if let Some(ref ct) = req.content_type {
