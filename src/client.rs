@@ -135,8 +135,20 @@ impl ZJHttpClient {
         }
 
         send_body(req, &mut stream).await.dot()?;
-        let resp = read_headers_to_resp(self, req, stream, addr).await.dot()?;
-        Ok(resp)
+        match read_headers_to_resp(self, req, stream, addr).await {
+            Ok(resp) => Ok(resp),
+            Err(e) if reused && !matches!(req.body, Body::Stream(_)) => {
+                trace!(
+                    "pooled connection failed during read_headers_to_resp, retrying with fresh connection: {e:#}"
+                );
+                let mut stream =
+                    connect_fresh_stream(self, &req, &addr).await.dot()?;
+                send_header(self, req, &mut stream).await.dot()?;
+                send_body(req, &mut stream).await.dot()?;
+                read_headers_to_resp(self, req, stream, addr).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn send_header_only(&self, req: &mut Request) -> Result<(BoxedStream, SocketAddr)> {
@@ -775,7 +787,10 @@ where
     loop {
         let n = stream.read(&mut tmp).await.dot()?;
         if n == 0 {
-            break;
+            return Err(anyhow!(
+                "unexpected EOF while reading until delimiter (read {} bytes)",
+                buf.len()
+            ));
         }
 
         buf.extend_from_slice(&tmp[..n]);
@@ -794,7 +809,6 @@ where
             return Ok((buf, overflow, overflow_len));
         }
     }
-    Ok((buf, [0u8; 4096], 0))
 }
 
 pub async fn read_until_v<S>(stream: &mut S, delimiter: &[u8], buf: &mut Vec<u8>) -> Result<usize>
@@ -1132,10 +1146,7 @@ mod tests {
         let data = b"Hello World";
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n").await;
-        assert!(result.is_ok());
-        let (buf, overflow, overflow_len) = result.unwrap();
-        assert_eq!(buf, b"Hello World");
-        assert_eq!(&overflow[..overflow_len], b"");
+        assert!(result.is_err());
     }
 
     #[async_std::test]
@@ -1154,10 +1165,7 @@ mod tests {
         let data = b"";
         let mut cursor = Cursor::new(data);
         let result = read_until(&mut cursor, b"\r\n").await;
-        assert!(result.is_ok());
-        let (buf, overflow, overflow_len) = result.unwrap();
-        assert_eq!(buf, b"");
-        assert_eq!(&overflow[..overflow_len], b"");
+        assert!(result.is_err());
     }
 
     #[async_std::test]
