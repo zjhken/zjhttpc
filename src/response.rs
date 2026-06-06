@@ -793,7 +793,15 @@ impl Response {
     // reading the entire body and return a JSON object
     pub async fn body_json(&mut self) -> Result<serde_json::Value> {
         let bytes = self.body_bytes().await?;
-        serde_json::from_slice(&bytes).map_err(|e| anyhow!("JSON parsing failed: {}", e))
+        serde_json::from_slice(&bytes).map_err(|e| {
+            let preview = String::from_utf8_lossy(&bytes);
+            let preview = if preview.len() > 200 {
+                format!("{}...(truncated, total {} bytes)", &preview[..200], bytes.len())
+            } else {
+                preview.into_owned()
+            };
+            anyhow!("JSON parsing failed: {e}\nraw body: {preview}")
+        })
     }
 
     pub fn content_length(&self) -> Option<u64> {
