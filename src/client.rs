@@ -17,7 +17,7 @@ use nom::{
 use rustls_native_certs::load_native_certs;
 use std::{
     net::SocketAddr,
-    sync::{Arc, LazyLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -33,7 +33,7 @@ use tracing::{error, trace};
 
 /// Connection type for pool key
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum ConnectionType {
+pub(crate) enum ConnectionType {
     /// Direct TCP connection (no proxy)
     DirectTcp,
     /// Direct TLS connection (no proxy)
@@ -46,19 +46,18 @@ enum ConnectionType {
 
 /// Key for identifying connections in the pool
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct ConnectionKey {
+pub(crate) struct ConnectionKey {
     /// The remote server address
-    addr: SocketAddr,
+    pub(crate) addr: SocketAddr,
     /// Type of connection
-    connection_type: ConnectionType,
+    pub(crate) connection_type: ConnectionType,
 }
 
-/// Unified connection pool for all connection types
-static CONNECTION_POOL: LazyLock<DashMap<ConnectionKey, Vec<BoxedStream>>> =
-    LazyLock::new(DashMap::new);
+/// Per-client connection pool
+pub(crate) type ConnectionPool = Arc<DashMap<ConnectionKey, Vec<BoxedStream>>>;
 
 /// Connection metadata for returning streams to the appropriate pool
-pub struct StreamInfo {
+pub(crate) struct StreamInfo {
     /// The socket address of the remote server
     pub addr: SocketAddr,
     /// Whether this is a TLS connection
@@ -68,10 +67,9 @@ pub struct StreamInfo {
 }
 
 /// HTTP client with configurable timeouts and proxy settings
-#[derive(Builder, Debug, Clone)]
+#[derive(Builder, Clone)]
 #[builder(setter(strip_option, prefix = "set"))]
 pub struct ZJHttpClient {
-    // connection_pool: unimplemented!(),
     #[builder(default = "Duration::from_secs(30)")]
     pub global_send_header_timeout: Duration,
     #[builder(default = "Duration::from_secs(30)")]
@@ -86,6 +84,23 @@ pub struct ZJHttpClient {
     pub global_proxy: Option<HttpsProxyOption>,
     #[builder(default = "64 * 1024")]
     pub global_max_header_bytes: usize,
+    #[builder(default = "Arc::new(DashMap::new())")]
+    pub(crate) connection_pool: ConnectionPool,
+}
+
+impl std::fmt::Debug for ZJHttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZJHttpClient")
+            .field("global_send_header_timeout", &self.global_send_header_timeout)
+            .field("global_read_header_timeout", &self.global_read_header_timeout)
+            .field("global_read_body_timeout", &self.global_read_body_timeout)
+            .field("global_connect_timeout", &self.global_connect_timeout)
+            .field("global_trust_store_pem", &self.global_trust_store_pem)
+            .field("global_proxy", &self.global_proxy)
+            .field("global_max_header_bytes", &self.global_max_header_bytes)
+            .field("connection_pool", &format!("<pool with {} entries>", self.connection_pool.len()))
+            .finish()
+    }
 }
 
 impl ZJHttpClient {
@@ -99,6 +114,7 @@ impl ZJHttpClient {
             global_trust_store_pem: None,
             global_proxy: None,
             global_max_header_bytes: Some(64 * 1024),
+            connection_pool: Some(Arc::new(DashMap::new())),
         }
     }
 
@@ -210,7 +226,7 @@ async fn pick_or_connect_stream(
             connection_type,
         };
 
-        if let Some(stream_from_pool) = try_pick_from_pool(&key) {
+        if let Some(stream_from_pool) = try_pick_from_pool(&client.connection_pool, &key) {
             trace!(?addr, "picking up proxy stream from pool");
             return Ok((stream_from_pool, true));
         }
@@ -244,7 +260,7 @@ async fn pick_or_connect_stream(
                 connection_type: ConnectionType::DirectTcp,
             };
 
-            if let Some(stream_from_pool) = try_pick_from_pool(&key) {
+            if let Some(stream_from_pool) = try_pick_from_pool(&client.connection_pool, &key) {
                 trace!(?addr, "picking up direct TCP stream from pool");
                 return Ok((stream_from_pool, true));
             }
@@ -258,7 +274,7 @@ async fn pick_or_connect_stream(
                 connection_type: ConnectionType::DirectTls,
             };
 
-            if let Some(stream_from_pool) = try_pick_from_pool(&key) {
+            if let Some(stream_from_pool) = try_pick_from_pool(&client.connection_pool, &key) {
                 trace!(?addr, "picking up direct TLS stream from pool");
                 return Ok((stream_from_pool, true));
             }
@@ -337,8 +353,8 @@ async fn connect_fresh_tls(
 /// Returns None if the pool is empty for this key.
 /// Does not pre-validate stream health — stale connections will fail naturally
 /// during the next read/write, at which point the caller can retry with a fresh connection.
-fn try_pick_from_pool(key: &ConnectionKey) -> Option<BoxedStream> {
-    CONNECTION_POOL.get_mut(key).and_then(|mut pool| pool.pop())
+fn try_pick_from_pool(pool: &ConnectionPool, key: &ConnectionKey) -> Option<BoxedStream> {
+    pool.get_mut(key).and_then(|mut pool| pool.pop())
 }
 
 async fn resolve_1st_ip(req: &mut Request) -> Result<SocketAddr> {
@@ -725,6 +741,7 @@ async fn read_headers_to_resp(
         proxy_used,
         read_body_timeout,
         &overflow[..overflow_len],
+        Some(client.connection_pool.clone()),
     )
     .map_err(|e| anyhow!("{e}"));
 }
@@ -831,7 +848,7 @@ where
 ///
 /// This is the preferred way to return streams to the pool as it doesn't require
 /// creating a temporary Response object.
-pub fn return_stream_to_pool(stream: BoxedStream, stream_info: StreamInfo) {
+pub(crate) fn return_stream_to_pool(pool: &ConnectionPool, stream: BoxedStream, stream_info: StreamInfo) {
     // Build the appropriate key based on connection metadata
     let key = if let Some(proxy) = &stream_info.proxy_used {
         // Proxy connection
@@ -862,7 +879,7 @@ pub fn return_stream_to_pool(stream: BoxedStream, stream_info: StreamInfo) {
 
     // Return stream to the unified pool
     use dashmap::mapref::entry::Entry;
-    match CONNECTION_POOL.entry(key.clone()) {
+    match pool.entry(key.clone()) {
         Entry::Occupied(mut entry) => {
             let pool = entry.get_mut();
             if pool.len() <= 30 {
@@ -876,29 +893,6 @@ pub fn return_stream_to_pool(stream: BoxedStream, stream_info: StreamInfo) {
             entry.insert(vec![stream]);
             trace!(key = ?(&key.addr, &key.connection_type), "add new vec to pool");
         }
-    }
-}
-
-/// Return a stream from a Response object to the appropriate connection pool
-///
-/// This function maintains backward compatibility by extracting the necessary
-/// metadata from the Response object and delegating to the new return_stream_to_pool function.
-/// The preferred approach for new code is to use return_stream_to_pool directly.
-pub fn return_stream_to_pool_from_response(resp: &mut Response) {
-    // Only return to pool if body was successfully read
-    if !resp.is_body_read_complete() {
-        // TODO: for now just close the connection
-        // in the future we can try to drain it with timeout
-        // but during the data reading, we have to consider the content-length and transfer-encoding
-        return;
-    }
-    if let Some(stream) = resp.body_raw_stream.take() {
-        let stream_info = StreamInfo {
-            addr: resp.addr,
-            is_tls: resp.is_tls,
-            proxy_used: resp.proxy_used.clone(),
-        };
-        return_stream_to_pool(stream, stream_info);
     }
 }
 

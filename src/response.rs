@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use tracing::error;
 
 use crate::{
-    client::return_stream_to_pool,
+    client::{ConnectionPool, return_stream_to_pool},
     error::ZjhttpcError,
     misc::HttpVersion,
     proxy::HttpsProxyOption,
@@ -30,6 +30,7 @@ pub struct ChunkedDecoderStream {
     addr: SocketAddr,
     is_tls: bool,
     proxy_used: Option<HttpsProxyOption>,
+    pool: Option<ConnectionPool>,
 }
 
 /// A fixed-length stream that tracks remaining bytes and returns 0 when complete
@@ -40,6 +41,7 @@ pub struct BodyFixedLengthStream {
     addr: SocketAddr,
     is_tls: bool,
     proxy_used: Option<HttpsProxyOption>,
+    pool: Option<ConnectionPool>,
 }
 
 /// A stream wrapper for responses with unknown length that returns the stream to pool when EOF is reached
@@ -49,6 +51,7 @@ pub struct BodyUnknownLengthStream {
     addr: SocketAddr,
     is_tls: bool,
     proxy_used: Option<HttpsProxyOption>,
+    pool: Option<ConnectionPool>,
 }
 
 type ChainedInner = ChainRead<SliceRead, BoxedStream>;
@@ -74,15 +77,17 @@ impl ChunkedDecoderStream {
             addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
             is_tls: false,
             proxy_used: None,
+            pool: None,
         }
     }
 
-    pub fn new_with_completion_flag(
+    pub(crate) fn new_with_completion_flag(
         inner: ChainedInner,
         completion_flag: Arc<AtomicBool>,
         addr: SocketAddr,
         is_tls: bool,
         proxy_used: Option<HttpsProxyOption>,
+        pool: Option<ConnectionPool>,
     ) -> Self {
         Self {
             inner: Some(inner),
@@ -94,6 +99,7 @@ impl ChunkedDecoderStream {
             addr,
             is_tls,
             proxy_used,
+            pool,
         }
     }
 
@@ -103,14 +109,14 @@ impl ChunkedDecoderStream {
 
     /// Return the original stream to the connection pool when fully consumed
     fn return_stream_to_pool(&mut self) {
-        if let Some(chain) = self.inner.take() {
+        if let (Some(chain), Some(pool)) = (self.inner.take(), self.pool.as_ref()) {
             let stream = chain.into_second();
             let stream_info = crate::client::StreamInfo {
                 addr: self.addr,
                 is_tls: self.is_tls,
                 proxy_used: self.proxy_used.clone(),
             };
-            return_stream_to_pool(stream, stream_info);
+            return_stream_to_pool(pool, stream, stream_info);
         }
     }
 
@@ -332,16 +338,18 @@ impl BodyFixedLengthStream {
             addr: std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
             is_tls: false,
             proxy_used: None,
+            pool: None,
         }
     }
 
-    pub fn new_with_completion_flag(
+    pub(crate) fn new_with_completion_flag(
         inner: ChainedInner,
         content_length: usize,
         completion_flag: Arc<AtomicBool>,
         addr: SocketAddr,
         is_tls: bool,
         proxy_used: Option<HttpsProxyOption>,
+        pool: Option<ConnectionPool>,
     ) -> Self {
         Self {
             inner: Some(inner),
@@ -350,6 +358,7 @@ impl BodyFixedLengthStream {
             addr,
             is_tls,
             proxy_used,
+            pool,
         }
     }
 
@@ -358,14 +367,14 @@ impl BodyFixedLengthStream {
     }
 
     fn return_stream_to_pool(&mut self) {
-        if let Some(chain) = self.inner.take() {
+        if let (Some(chain), Some(pool)) = (self.inner.take(), self.pool.as_ref()) {
             let stream = chain.into_second();
             let stream_info = crate::client::StreamInfo {
                 addr: self.addr,
                 is_tls: self.is_tls,
                 proxy_used: self.proxy_used.clone(),
             };
-            return_stream_to_pool(stream, stream_info);
+            return_stream_to_pool(pool, stream, stream_info);
         }
     }
 }
@@ -423,12 +432,13 @@ impl async_std::io::Read for BodyFixedLengthStream {
 }
 
 impl BodyUnknownLengthStream {
-    pub fn new_with_completion_flag(
+    pub(crate) fn new_with_completion_flag(
         inner: ChainedInner,
         completion_flag: Arc<AtomicBool>,
         addr: SocketAddr,
         is_tls: bool,
         proxy_used: Option<HttpsProxyOption>,
+        pool: Option<ConnectionPool>,
     ) -> Self {
         Self {
             inner: Some(inner),
@@ -436,6 +446,7 @@ impl BodyUnknownLengthStream {
             addr,
             is_tls,
             proxy_used,
+            pool,
         }
     }
 
@@ -444,14 +455,14 @@ impl BodyUnknownLengthStream {
     }
 
     fn return_stream_to_pool(&mut self) {
-        if let Some(chain) = self.inner.take() {
+        if let (Some(chain), Some(pool)) = (self.inner.take(), self.pool.as_ref()) {
             let stream = chain.into_second();
             let stream_info = crate::client::StreamInfo {
                 addr: self.addr,
                 is_tls: self.is_tls,
                 proxy_used: self.proxy_used.clone(),
             };
-            return_stream_to_pool(stream, stream_info);
+            return_stream_to_pool(pool, stream, stream_info);
         }
     }
 }
@@ -506,33 +517,27 @@ pub struct Response {
     body_completion_flag: Arc<AtomicBool>,
     /// Timeout for reading response body
     pub read_body_timeout: Option<std::time::Duration>,
+    /// Connection pool to return streams to
+    pool: Option<ConnectionPool>,
 }
 
 impl Drop for Response {
     fn drop(&mut self) {
-        // Check if body was fully consumed
-        if self.body_completion_flag.load(Ordering::Relaxed) {
-            // Body was fully consumed
-            // If body_raw_stream is still present (user used raw_stream + mark_complete), return to pool
-            if let Some(stream) = self.body_raw_stream.take() {
-                let stream_info = crate::client::StreamInfo {
-                    addr: self.addr,
-                    is_tls: self.is_tls,
-                    proxy_used: self.proxy_used.clone(),
-                };
-                return_stream_to_pool(stream, stream_info);
-            }
-            // If body_raw_stream is None, managed stream already returned it
-        } else {
-            // Body was NOT fully consumed
-            // Do NOT return to pool to avoid contamination
-            // The connection will be closed when the stream is dropped
+        if self.body_completion_flag.load(Ordering::Relaxed)
+            && let (Some(stream), Some(pool)) = (self.body_raw_stream.take(), self.pool.as_ref())
+        {
+            let stream_info = crate::client::StreamInfo {
+                addr: self.addr,
+                is_tls: self.is_tls,
+                proxy_used: self.proxy_used.clone(),
+            };
+            return_stream_to_pool(pool, stream, stream_info);
         }
     }
 }
 
 impl Response {
-    pub fn new_from_parse_result(
+    pub(crate) fn new_from_parse_result(
         http_version: &str,
         status_code: &str,
         headers_vec: Vec<(String, String)>,
@@ -542,6 +547,7 @@ impl Response {
         proxy_used: Option<HttpsProxyOption>,
         read_body_timeout: Option<std::time::Duration>,
         body_prefix: &[u8],
+        pool: Option<ConnectionPool>,
     ) -> Result<Self, ZjhttpcError> {
         let http_version = match http_version {
             "1.1" => HttpVersion::V1_1,
@@ -579,6 +585,7 @@ impl Response {
             proxy_used,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout,
+            pool,
         };
         return Ok(resp);
     }
@@ -695,18 +702,17 @@ impl Response {
             return None;
         }
 
-        // Check if this is chunked encoding
         let is_chunked = self
             .headers
             .get("transfer-encoding")
             .map(|set| set.iter().any(|v| v.contains("chunked")))
             .unwrap_or(false);
 
-        // Check if Content-Length is present
         let content_length = self.content_length();
 
         if let Some(stream) = self.body_raw_stream.take() {
             let prefix = &self.body_prefix[..self.body_prefix_len];
+            let pool = self.pool.clone();
             if is_chunked {
                 let chain = crate::stream::ChainRead::new(
                     crate::stream::SliceRead::new(prefix),
@@ -718,6 +724,7 @@ impl Response {
                     self.addr,
                     self.is_tls,
                     self.proxy_used.clone(),
+                    pool,
                 );
                 Some(Box::new(decoder) as crate::stream::ReadStream)
             } else if let Some(length) = content_length {
@@ -732,6 +739,7 @@ impl Response {
                     self.addr,
                     self.is_tls,
                     self.proxy_used.clone(),
+                    pool,
                 );
                 Some(Box::new(fixed_length_stream) as crate::stream::ReadStream)
             } else {
@@ -745,6 +753,7 @@ impl Response {
                     self.addr,
                     self.is_tls,
                     self.proxy_used.clone(),
+                    pool,
                 );
                 Some(Box::new(unknown_length_stream) as crate::stream::ReadStream)
             }
@@ -1240,6 +1249,7 @@ mod tests {
             std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             false,
             None,
+            None,
         );
 
         // Read all data
@@ -1355,6 +1365,7 @@ mod tests {
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
+            pool: None,
         };
 
         // Test initial state
@@ -1381,6 +1392,7 @@ mod tests {
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
+            pool: None,
         };
 
         // Initially not complete
@@ -1414,6 +1426,7 @@ mod tests {
             proxy_used: None,
             body_completion_flag: completion_flag.clone(),
             read_body_timeout: None,
+            pool: None,
         };
 
         // Initially not complete
@@ -1594,6 +1607,7 @@ mod tests {
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
+            pool: None,
         };
 
         // Test body_bytes method
@@ -1691,6 +1705,7 @@ mod tests {
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
+            pool: None,
         };
 
         // Test body_json method
@@ -1786,6 +1801,7 @@ mod tests {
             proxy_used: None,
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
+            pool: None,
         };
 
         // Test body_json method with invalid JSON
@@ -1846,6 +1862,7 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             false,
             None,
+            None,
         );
 
         let mut out = Vec::new();
@@ -1868,6 +1885,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             "127.0.0.1:8080".parse().unwrap(),
             false,
+            None,
             None,
         );
 
@@ -1893,6 +1911,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             "127.0.0.1:8080".parse().unwrap(),
             false,
+            None,
             None,
         );
 
@@ -1924,6 +1943,7 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             false,
             None,
+            None,
         );
 
         let mut out = Vec::new();
@@ -1945,6 +1965,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             "127.0.0.1:8080".parse().unwrap(),
             false,
+            None,
             None,
         );
 
@@ -1970,6 +1991,7 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
             false,
             None,
+            None,
         );
 
         let mut out = Vec::new();
@@ -1993,6 +2015,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             "127.0.0.1:8080".parse().unwrap(),
             false,
+            None,
             None,
         );
 
