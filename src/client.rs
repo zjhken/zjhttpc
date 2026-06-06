@@ -583,7 +583,7 @@ where
             stream.write_all(b"\r\n").await.dot()?;
         }
         // Write Content-Type if set and user hasn't manually set it in headers
-        if let Some(ct) = req.content_type {
+        if let Some(ref ct) = req.content_type {
             let already_set = req
                 .headers
                 .keys()

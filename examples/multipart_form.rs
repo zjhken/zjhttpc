@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("Example 4 - Request with multipart form:");
     println!("URL: {}", request.url);
-    println!("Content-Type: {}", request.content_type.unwrap_or("none"));
+    println!("Content-Type: {}", request.content_type.as_deref().unwrap_or("none"));
     println!("Content-Length: {} (0 = unknown, will use chunked encoding)", request.content_length);
 
     // Example 5: MIME type detection
