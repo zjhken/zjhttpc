@@ -2,7 +2,7 @@ use anyhow_ext::Result;
 use async_std::fs::File;
 use std::fmt;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 /// Request body types
 pub enum Body {
@@ -410,28 +410,11 @@ impl fmt::Debug for BodyMultipartForm {
     }
 }
 
-/// Generate a random boundary string for multipart form data
+/// Generate a random boundary string for multipart form data using `rand::rng()`.
 fn generate_boundary() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("----Boundary{}{}", timestamp, rand_random_string(8))
-}
-
-/// Generate a random alphanumeric string
-fn rand_random_string(len: usize) -> String {
-    const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut result = String::with_capacity(len);
-    for _ in 0..len {
-        let idx = (SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0) % CHARS.len() as u128) as usize;
-        result.push(CHARS[idx] as char);
-    }
-    result
+    use rand::Rng;
+    let id: u64 = rand::rng().random();
+    format!("----Boundary{id:016x}")
 }
 
 /// Detect MIME type based on file extension
