@@ -27,9 +27,9 @@ for _ in 0..len {
 
 Should use the already-imported `rand::rng()` instead.
 
-### 3. `load_native_certs().expect()` will panic
+### 3. Library should not panic — `load_native_certs().expect()`
 
-`client.rs:529` — TLS config creation uses `expect` instead of returning an error, which can cause an unrecoverable crash. Same issue in `proxy.rs:304`.
+`client.rs:529`, `proxy.rs:304` — `load_native_certs().expect()` will panic if system certs cannot be loaded. As a library, this decision should be left to the caller. Should return `Result` instead.
 
 ---
 

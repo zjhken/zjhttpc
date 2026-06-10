@@ -6,7 +6,6 @@ description = "HTTP client made by Jinhui ZHANG. Aims at easy to use, with speci
 license = "GPL-3.0-only"
 
 [dependencies]
-anyhow = "1.0.99"
 anyhow_ext = "0.2.1"
 async-std = { version = "1.13.0", features = ["attributes"] }
 async-tls = "0.13.0"
@@ -25,9 +24,7 @@ rustls-pemfile = "2.2.0"
 serde = "1.0.219"
 serde_json = "1.0.140"
 serde_qs = "0.15.0"
-snafu = { version = "0.8.6", features = ["futures"] }
 thiserror = "2.0.12"
-thiserror-context = "0.1.2"
 tracing = "0.1.41"
 url = "2.5.4"
 

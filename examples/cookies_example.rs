@@ -1,10 +1,11 @@
 use zjhttpc::client::ZJHttpClient;
 use zjhttpc::requestx::Request;
+use zjhttpc::Result;
 
 #[async_std::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     // Create a client
-    let client = ZJHttpClient::builder().build()?;
+    let client = ZJHttpClient::builder().build().unwrap();
 
     // First request - login to get cookies
     let mut login_request = Request::new("POST", "https://httpbin.org/cookies/set?sessionid=abc123&userdata=alice")?

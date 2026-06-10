@@ -1,7 +1,7 @@
 use std::time::Duration;
-use zjhttpc::{client::ZJHttpClient, requestx::Request};
+use zjhttpc::{client::ZJHttpClient, requestx::Request, Result};
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     async_std::task::block_on(async {
     // Test 1: Client-level connect timeout
     println!("Test 1: Client-level connect timeout (default 3 seconds)");

@@ -1,8 +1,8 @@
-use std::io::Cursor;
 use zjhttpc::body::{BodyMultipartForm, detect_mime_type};
 use zjhttpc::requestx::Request;
+use zjhttpc::Result;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     // Example 1: Simple text fields
     let form1 = BodyMultipartForm::new()
         .add("username", "alice")

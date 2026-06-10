@@ -1,7 +1,8 @@
+use zjhttpc::Result;
 use zjhttpc::body::BodyForm;
 use zjhttpc::requestx::Request;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     // Example 1: Simple form data
     let form1 = BodyForm::new()
         .add("username", "alice")
@@ -33,12 +34,11 @@ fn main() -> anyhow::Result<()> {
     println!("Length: {}\n", form3.len());
 
     // Example 4: Using with Request
-    let request = Request::new("POST", "https://example.com/login")?
-        .set_body_form(
-            BodyForm::new()
-                .add("username", "alice")
-                .add("password", "secret")
-        );
+    let request = Request::new("POST", "https://example.com/login")?.set_body_form(
+        BodyForm::new()
+            .add("username", "alice")
+            .add("password", "secret"),
+    );
 
     println!("Example 4 - Request with form body:");
     println!("URL: {}", request.url);

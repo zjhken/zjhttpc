@@ -1,15 +1,15 @@
-use anyhow_ext::{Context, Result, anyhow};
 use async_std::io::ReadExt;
 use encoding_rs::GBK;
 use hashbrown::HashMap;
 use indexmap::IndexSet;
 use std::net::SocketAddr;
 
+use anyhow_ext::Context as _;
 use tracing::error;
 
 use crate::{
     client::ConnectionPool,
-    error::ZjhttpcError,
+    error::{Result, ZjhttpcError},
     misc::HttpVersion,
     proxy::HttpsProxyOption,
     stream::{BoxedStream, ChainRead, SliceRead},
@@ -118,7 +118,6 @@ impl ChunkedDecoderStream {
             pool.return_stream(stream, stream_info);
         }
     }
-
 }
 
 impl async_std::io::Read for ChunkedDecoderStream {
@@ -168,20 +167,19 @@ impl async_std::io::Read for ChunkedDecoderStream {
                                     continue;
                                 }
 
-                                let chunk_size =
-                                    match usize::from_str_radix(line_str.trim(), 16) {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            return std::task::Poll::Ready(Err(std::io::Error::new(
-                                                std::io::ErrorKind::InvalidData,
-                                                format!(
-                                                    "invalid chunk size '{:?}': {}",
-                                                    line_str.as_bytes(),
-                                                    e
-                                                ),
-                                            )));
-                                        }
-                                    };
+                                let chunk_size = match usize::from_str_radix(line_str.trim(), 16) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        return std::task::Poll::Ready(Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!(
+                                                "invalid chunk size '{:?}': {}",
+                                                line_str.as_bytes(),
+                                                e
+                                            ),
+                                        )));
+                                    }
+                                };
 
                                 self.line_buffer.clear();
 
@@ -258,13 +256,10 @@ impl async_std::io::Read for ChunkedDecoderStream {
                             self.trailer_buffer.push(one_byte[0]);
                             if self.trailer_buffer.ends_with(b"\r\n") {
                                 if self.trailer_buffer.len() != 2 {
-                                    let x =
-                                        String::from_utf8_lossy(&self.trailer_buffer);
+                                    let x = String::from_utf8_lossy(&self.trailer_buffer);
                                     return std::task::Poll::Ready(Err(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
-                                        format!(
-                                            "expected \\r\\n after chunk data, got: {x}"
-                                        ),
+                                        format!("expected \\r\\n after chunk data, got: {x}"),
                                     )));
                                 }
                                 self.trailer_buffer.clear();
@@ -302,13 +297,10 @@ impl async_std::io::Read for ChunkedDecoderStream {
                             self.trailer_buffer.push(one_byte[0]);
                             if self.trailer_buffer.ends_with(b"\r\n") {
                                 if self.trailer_buffer.len() != 2 {
-                                    let x =
-                                        String::from_utf8_lossy(&self.trailer_buffer);
+                                    let x = String::from_utf8_lossy(&self.trailer_buffer);
                                     return std::task::Poll::Ready(Err(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
-                                        format!(
-                                            "expected \\r\\n after final chunk, got: {x}"
-                                        ),
+                                        format!("expected \\r\\n after final chunk, got: {x}"),
                                     )));
                                 }
                                 self.trailer_buffer.clear();
@@ -547,15 +539,19 @@ impl Response {
         read_body_timeout: Option<std::time::Duration>,
         body_prefix: &[u8],
         pool: Option<ConnectionPool>,
-    ) -> Result<Self, ZjhttpcError> {
+    ) -> std::result::Result<Self, ZjhttpcError> {
         let http_version = match http_version {
             "1.1" => HttpVersion::V1_1,
             "1.0" => HttpVersion::V1_0,
-            others => return Err(ZjhttpcError::InvalidHttpResponseVersion(others.to_string())),
+            others => {
+                return Err(ZjhttpcError::InvalidResponse(format!(
+                    "unsupported HTTP version: {others}"
+                )));
+            }
         };
-        let status_code: u16 = status_code
-            .parse()
-            .map_err(|_e| ZjhttpcError::InvalidHttpResponseStatusCode(status_code.to_string()))?;
+        let status_code: u16 = status_code.parse().map_err(|_| {
+            ZjhttpcError::InvalidResponse(format!("invalid HTTP status code: {status_code}"))
+        })?;
         let mut headers: HashMap<String, IndexSet<String>> = HashMap::new();
         for (key, value) in headers_vec {
             match headers.get_mut(&key) {
@@ -636,7 +632,7 @@ impl Response {
 
     pub async fn body_string(&mut self) -> Result<String> {
         if self.is_body_read_complete() {
-            return Err(anyhow!("response body has been read"));
+            return Err(ZjhttpcError::BodyAlreadyRead);
         }
 
         if let Some(mut stream) = self.body_managed_stream() {
@@ -650,15 +646,16 @@ impl Response {
                 {
                     bytes.extend_from_slice(&buf[..n]);
                 }
-                Ok::<(), anyhow::Error>(())
+                Ok::<(), ZjhttpcError>(())
             };
 
             if let Some(timeout) = self.read_body_timeout {
                 async_std::future::timeout(timeout, read_future)
                     .await
-                    .map_err(|_| anyhow!("read body timeout after {:?}", timeout))??;
+                    .map_err(|_| ZjhttpcError::ReadBodyTimeout(timeout))
+                    .dot()??;
             } else {
-                read_future.await?;
+                read_future.await.dot()?;
             }
 
             // considering the encoding
@@ -713,10 +710,8 @@ impl Response {
             let prefix = &self.body_prefix[..self.body_prefix_len];
             let pool = self.pool.clone();
             if is_chunked {
-                let chain = crate::stream::ChainRead::new(
-                    crate::stream::SliceRead::new(prefix),
-                    stream,
-                );
+                let chain =
+                    crate::stream::ChainRead::new(crate::stream::SliceRead::new(prefix), stream);
                 let decoder = ChunkedDecoderStream::new_with_completion_flag(
                     chain,
                     self.body_completion_flag.clone(),
@@ -727,10 +722,8 @@ impl Response {
                 );
                 Some(Box::new(decoder) as crate::stream::ReadStream)
             } else if let Some(length) = content_length {
-                let chain = crate::stream::ChainRead::new(
-                    crate::stream::SliceRead::new(prefix),
-                    stream,
-                );
+                let chain =
+                    crate::stream::ChainRead::new(crate::stream::SliceRead::new(prefix), stream);
                 let fixed_length_stream = BodyFixedLengthStream::new_with_completion_flag(
                     chain,
                     length as usize,
@@ -742,10 +735,8 @@ impl Response {
                 );
                 Some(Box::new(fixed_length_stream) as crate::stream::ReadStream)
             } else {
-                let chain = crate::stream::ChainRead::new(
-                    crate::stream::SliceRead::new(prefix),
-                    stream,
-                );
+                let chain =
+                    crate::stream::ChainRead::new(crate::stream::SliceRead::new(prefix), stream);
                 let unknown_length_stream = BodyUnknownLengthStream::new_with_completion_flag(
                     chain,
                     self.body_completion_flag.clone(),
@@ -767,7 +758,7 @@ impl Response {
     /// For large bodies, consider using body_managed_stream() for streaming access.
     pub async fn body_bytes(&mut self) -> Result<Vec<u8>> {
         if self.is_body_read_complete() {
-            return Err(anyhow!("response body has been read"));
+            return Err(ZjhttpcError::BodyAlreadyRead);
         }
 
         if let Some(mut stream) = self.body_managed_stream() {
@@ -781,15 +772,16 @@ impl Response {
                 {
                     bytes.extend_from_slice(&buf[..n]);
                 }
-                Ok::<(), anyhow::Error>(())
+                Ok::<(), ZjhttpcError>(())
             };
 
             if let Some(timeout) = self.read_body_timeout {
                 async_std::future::timeout(timeout, read_future)
                     .await
-                    .map_err(|_| anyhow!("read body timeout after {:?}", timeout))??;
+                    .map_err(|_| ZjhttpcError::ReadBodyTimeout(timeout))
+                    .dot()??;
             } else {
-                read_future.await?;
+                read_future.await.dot()?;
             }
 
             Ok(bytes)
@@ -800,15 +792,22 @@ impl Response {
 
     // reading the entire body and return a JSON object
     pub async fn body_json(&mut self) -> Result<serde_json::Value> {
-        let bytes = self.body_bytes().await?;
+        let bytes = self.body_bytes().await.dot()?;
         serde_json::from_slice(&bytes).map_err(|e| {
             let preview = String::from_utf8_lossy(&bytes);
             let preview = if preview.len() > 200 {
-                format!("{}...(truncated, total {} bytes)", &preview[..200], bytes.len())
+                format!(
+                    "{}...(truncated, total {} bytes)",
+                    &preview[..200],
+                    bytes.len()
+                )
             } else {
                 preview.into_owned()
             };
-            anyhow!("JSON parsing failed: {e}\nraw body: {preview}")
+            ZjhttpcError::JsonParsing {
+                message: e.to_string(),
+                preview,
+            }
         })
     }
 
@@ -969,10 +968,7 @@ mod tests {
         let boxed_stream = Box::new(test_stream) as BoxedStream;
 
         // Create BodyFixedLengthStream with exact content length
-        let chain = crate::stream::ChainRead::new(
-            crate::stream::SliceRead::new(&[]),
-            boxed_stream,
-        );
+        let chain = crate::stream::ChainRead::new(crate::stream::SliceRead::new(&[]), boxed_stream);
         let mut fixed_stream = BodyFixedLengthStream::new(chain, data.len());
 
         // Test reading the entire content
@@ -1056,10 +1052,7 @@ mod tests {
         let boxed_stream = Box::new(test_stream) as BoxedStream;
 
         // Create BodyFixedLengthStream with exact content length
-        let chain = crate::stream::ChainRead::new(
-            crate::stream::SliceRead::new(&[]),
-            boxed_stream,
-        );
+        let chain = crate::stream::ChainRead::new(crate::stream::SliceRead::new(&[]), boxed_stream);
         let mut fixed_stream = BodyFixedLengthStream::new(chain, data.len());
 
         // Test reading partial content
@@ -1149,10 +1142,7 @@ mod tests {
         let boxed_stream = Box::new(test_stream) as BoxedStream;
 
         // Test ChunkedDecoderStream
-        let chain = crate::stream::ChainRead::new(
-            crate::stream::SliceRead::new(&[]),
-            boxed_stream,
-        );
+        let chain = crate::stream::ChainRead::new(crate::stream::SliceRead::new(&[]), boxed_stream);
         let mut decoder = ChunkedDecoderStream::new(chain);
 
         // Read all data
@@ -1238,10 +1228,7 @@ mod tests {
 
         // Create BodyUnknownLengthStream
         let completion_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let chain = crate::stream::ChainRead::new(
-            crate::stream::SliceRead::new(&[]),
-            boxed_stream,
-        );
+        let chain = crate::stream::ChainRead::new(crate::stream::SliceRead::new(&[]), boxed_stream);
         let mut unknown_stream = BodyUnknownLengthStream::new_with_completion_flag(
             chain,
             completion_flag,
@@ -1503,10 +1490,7 @@ mod tests {
         let boxed_stream = Box::new(test_stream) as BoxedStream;
 
         // Create BodyFixedLengthStream with zero content length
-        let chain = crate::stream::ChainRead::new(
-            crate::stream::SliceRead::new(&[]),
-            boxed_stream,
-        );
+        let chain = crate::stream::ChainRead::new(crate::stream::SliceRead::new(&[]), boxed_stream);
         let mut fixed_stream = BodyFixedLengthStream::new(chain, 0);
 
         // Test that reading returns 0 immediately
@@ -1819,7 +1803,10 @@ mod tests {
     }
     impl MockStream {
         fn new(data: &[u8]) -> Self {
-            Self { data: data.to_vec(), pos: 0 }
+            Self {
+                data: data.to_vec(),
+                pos: 0,
+            }
         }
     }
     impl async_std::io::Read for MockStream {
@@ -1829,18 +1816,37 @@ mod tests {
             buf: &mut [u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
             let n = std::cmp::min(buf.len(), self.data.len() - self.pos);
-            if n == 0 { return std::task::Poll::Ready(Ok(0)); }
+            if n == 0 {
+                return std::task::Poll::Ready(Ok(0));
+            }
             buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
             self.pos += n;
             std::task::Poll::Ready(Ok(n))
         }
     }
     impl async_std::io::Write for MockStream {
-        fn poll_write(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>, _buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
-            std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "readonly")))
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "readonly",
+            )))
         }
-        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
-        fn poll_close(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
     }
     impl crate::stream::RWStream for MockStream {}
 

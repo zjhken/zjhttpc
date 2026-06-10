@@ -1,7 +1,7 @@
 use std::time::Duration;
-use zjhttpc::{client::ZJHttpClient, requestx::Request};
+use zjhttpc::{client::ZJHttpClient, requestx::Request, Result};
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     async_std::task::block_on(async {
     println!("Testing proxy connect timeout functionality...");
 

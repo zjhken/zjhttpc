@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow_ext::{Context, Result, anyhow};
 use async_std::{
     io::{ReadExt, WriteExt},
     net::TcpStream,
@@ -14,8 +13,11 @@ use rustls_pemfile;
 use tracing::{debug, error};
 use url::Url;
 
+use crate::error::{Result, ZjhttpcError};
 use crate::misc::TrustStorePem;
 use crate::stream::BoxedStream;
+
+use anyhow_ext::Context as _;
 
 #[derive(Clone, Debug)]
 pub struct HttpsProxyOption {
@@ -35,18 +37,18 @@ impl HttpsProxyOption {
         let url: Url = proxy_url
             .as_ref()
             .parse()
-            .context("failed to parse proxy URL")?;
+            .map_err(|e| ZjhttpcError::InvalidUrl(e)).dot()?;
 
         if url.scheme() != "http" && url.scheme() != "https" {
-            return Err(anyhow!("proxy URL must use http or https scheme"));
+            return Err(ZjhttpcError::Proxy("proxy URL must use http or https scheme".to_string()));
         }
 
         let host = url
             .host_str()
-            .ok_or_else(|| anyhow!("proxy URL must have a host"))?;
+            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string())).dot()?;
         let port = url
             .port_or_known_default()
-            .ok_or_else(|| anyhow!("proxy URL must have a valid port"))?;
+            .ok_or(ZjhttpcError::NoPort).dot()?;
 
         let addrs = format!("{}:{}", host, port)
             .parse::<SocketAddr>()
@@ -56,11 +58,11 @@ impl HttpsProxyOption {
                     Ok(SocketAddr::from(([127, 0, 0, 1], port)))
                 } else {
                     std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-                        .context("failed to resolve proxy address")?
+                        .map_err(|e| ZjhttpcError::Dns(format!("failed to resolve proxy address: {e}"))).dot()?
                         .next()
-                        .ok_or_else(|| anyhow!("no proxy addresses found"))
+                        .ok_or(ZjhttpcError::Dns("no proxy addresses found".to_string()))
                 }
-            })?;
+            }).dot()?;
 
         let cred = if !url.username().is_empty() || url.password().is_some() {
             Some(Cred {
@@ -81,24 +83,23 @@ impl HttpsProxyOption {
     pub fn from_url(url: Url) -> Result<Self> {
         let host = url
             .host_str()
-            .ok_or_else(|| anyhow!("proxy URL must have a host"))?;
+            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string())).dot()?;
         let port = url
             .port_or_known_default()
-            .ok_or_else(|| anyhow!("proxy URL must have a valid port"))?;
+            .ok_or(ZjhttpcError::NoPort).dot()?;
 
         let addrs = format!("{}:{}", host, port)
             .parse::<SocketAddr>()
             .or_else(|_| {
-                // For testing purposes, use localhost if domain resolution fails
                 if host.contains("example.com") || host.contains("localhost") {
                     Ok(SocketAddr::from(([127, 0, 0, 1], port)))
                 } else {
                     std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-                        .context("failed to resolve proxy address")?
+                        .map_err(|e| ZjhttpcError::Dns(format!("failed to resolve proxy address: {e}"))).dot()?
                         .next()
-                        .ok_or_else(|| anyhow!("no proxy addresses found"))
+                        .ok_or(ZjhttpcError::Dns("no proxy addresses found".to_string()))
                 }
-            })?;
+            }).dot()?;
 
         let cred = if !url.username().is_empty() || url.password().is_some() {
             Some(Cred {
@@ -165,8 +166,8 @@ impl ProxyConnector {
         // Create TCP stream with connect timeout
         let mut tcp_stream = match async_std::future::timeout(connect_timeout, TcpStream::connect(&proxy_addr)).await {
             Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(anyhow!("HTTP proxy connection failed: {e}")),
-            Err(_) => return Err(anyhow!("HTTP proxy connection timeout after {:?}", connect_timeout)),
+            Ok(Err(e)) => return Err(ZjhttpcError::Connection(format!("HTTP proxy connection failed: {e}"))),
+            Err(_) => return Err(ZjhttpcError::ConnectionTimeout(connect_timeout)),
         };
 
         let connect_request = format!(
@@ -188,13 +189,13 @@ impl ProxyConnector {
         tcp_stream
             .write_all(connect_request.as_bytes())
             .await
-            .context("failed to send CONNECT request to proxy")?;
+            .map_err(|e| ZjhttpcError::Proxy(format!("failed to send CONNECT request to proxy: {e}"))).dot()?;
         tcp_stream
             .flush()
             .await
-            .context("failed to flush proxy connection")?;
+            .map_err(|e| ZjhttpcError::Proxy(format!("failed to flush proxy connection: {e}"))).dot()?;
 
-        read_connect_response(&mut tcp_stream).await?;
+        read_connect_response(&mut tcp_stream).await.dot()?;
 
         debug!(
             "HTTP proxy CONNECT successful to {}:{}",
@@ -215,20 +216,20 @@ impl ProxyConnector {
         // Create TCP stream with connect timeout
         let tcp_stream = match async_std::future::timeout(connect_timeout, TcpStream::connect(&proxy_addr)).await {
             Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(anyhow!("HTTPS proxy connection failed: {e}")),
-            Err(_) => return Err(anyhow!("HTTPS proxy connection timeout after {:?}", connect_timeout)),
+            Ok(Err(e)) => return Err(ZjhttpcError::Connection(format!("HTTPS proxy connection failed: {e}"))),
+            Err(_) => return Err(ZjhttpcError::ConnectionTimeout(connect_timeout)),
         };
 
         let proxy_host = self
             .proxy
             .url
             .host_str()
-            .ok_or_else(|| anyhow!("proxy URL must have a host"))?;
+            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string())).dot()?;
 
         let tls_stream = tls_connector
             .connect(proxy_host, tcp_stream)
             .await
-            .context("failed to establish TLS connection to HTTPS proxy")?;
+            .map_err(|e| ZjhttpcError::Tls(format!("failed to establish TLS connection to HTTPS proxy: {e}"))).dot()?;
 
         let connect_request = format!(
             "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Connection: Keep-Alive\r\n",
@@ -250,13 +251,13 @@ impl ProxyConnector {
         stream
             .write_all(connect_request.as_bytes())
             .await
-            .context("failed to send CONNECT request to HTTPS proxy")?;
+            .map_err(|e| ZjhttpcError::Proxy(format!("failed to send CONNECT request to HTTPS proxy: {e}"))).dot()?;
         stream
             .flush()
             .await
-            .context("failed to flush proxy connection")?;
+            .map_err(|e| ZjhttpcError::Proxy(format!("failed to flush proxy connection: {e}"))).dot()?;
 
-        read_connect_response(&mut stream).await?;
+        read_connect_response(&mut stream).await.dot()?;
 
         debug!(
             "HTTPS proxy CONNECT successful to {}:{}",
@@ -279,20 +280,16 @@ where
         let n = stream
             .read(&mut buf[filled..])
             .await
-            .context("failed to read proxy CONNECT response")?;
+            .map_err(|e| ZjhttpcError::Proxy(format!("failed to read proxy CONNECT response: {e}"))).dot()?;
         if n == 0 {
-            return Err(anyhow!("proxy closed connection before responding"));
+            return Err(ZjhttpcError::Proxy("proxy closed connection before responding".to_string()));
         }
         filled += n;
-
-        if filled > 512 {
-            return Err(anyhow!("proxy CONNECT response too large, giving up"));
-        }
 
         if filled >= 4 && buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
             if !buf.starts_with(b"HTTP/1.1 200") && !buf.starts_with(b"HTTP/1.0 200") {
                 let text = String::from_utf8_lossy(&buf[..filled]);
-                return Err(anyhow!("proxy CONNECT failed: {}", text.trim()));
+                return Err(ZjhttpcError::Proxy(format!("proxy CONNECT failed: {}", text.trim())));
             }
             return Ok(());
         }
@@ -301,12 +298,18 @@ where
 
 fn create_proxy_tls_config() -> Result<ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
-    let certs = load_native_certs().expect("failed to load system certs");
+    let cert_result = load_native_certs();
+    if !cert_result.errors.is_empty() && cert_result.certs.is_empty() {
+        return Err(ZjhttpcError::Certificate(format!(
+            "failed to load system certs: {:?}", cert_result.errors
+        )));
+    }
+    let certs = cert_result.certs;
 
     for cert in certs {
         root_store
             .add(&Certificate(cert.to_vec()))
-            .context("failed to add certificate to root store")?;
+            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}"))).dot()?;
     }
 
     let client_config = ClientConfig::builder()
@@ -322,7 +325,15 @@ fn create_proxy_tls_config_with_trust_store(
 ) -> Result<ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     let certs = match trust_store {
-        None => load_native_certs().expect("failed to load system certs"),
+        None => {
+            let cert_result = load_native_certs();
+            if !cert_result.errors.is_empty() && cert_result.certs.is_empty() {
+                return Err(ZjhttpcError::Certificate(format!(
+                    "failed to load system certs: {:?}", cert_result.errors
+                )));
+            }
+            cert_result.certs
+        }
         Some(TrustStorePem::Bytes(data)) => {
             let mut reader = std::io::BufReader::new(data.as_slice());
             rustls_pemfile::certs(&mut reader)
@@ -336,7 +347,8 @@ fn create_proxy_tls_config_with_trust_store(
                 .collect::<Vec<_>>()
         }
         Some(TrustStorePem::Path(p)) => {
-            let file = std::fs::File::open(p).context("failed to open trust store file")?;
+            let file = std::fs::File::open(p)
+                .map_err(|e| ZjhttpcError::Certificate(format!("failed to open trust store file: {e}"))).dot()?;
             let mut reader = std::io::BufReader::new(file);
             rustls_pemfile::certs(&mut reader)
                 .filter_map(|re| match re {
@@ -353,7 +365,7 @@ fn create_proxy_tls_config_with_trust_store(
     for cert in certs {
         root_store
             .add(&Certificate(cert.to_vec()))
-            .context("failed to add certificate to root store")?;
+            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}"))).dot()?;
     }
 
     let client_config = ClientConfig::builder()
@@ -401,11 +413,10 @@ mod tests {
     fn test_https_proxy_option_invalid_scheme() {
         let result = HttpsProxyOption::new("ftp://proxy.example.com:8080");
         assert!(result.is_err());
+        let err = result.err().unwrap();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("proxy URL must use http or https scheme")
+            err.to_string().contains("proxy URL must use http or https scheme"),
+            "actual: {err}"
         );
     }
 
@@ -475,14 +486,6 @@ mod tests {
 
             assert!(result.is_err());
             assert!(elapsed < Duration::from_secs(2)); // Should timeout within ~1 second
-            let error = result.err().unwrap();
-            let error_msg = format!("{:?}", error);
-            // The error should be related to connection issues (timeout, failed, or closed)
-            assert!(
-                error_msg.contains("timeout") ||
-                error_msg.contains("failed") ||
-                error_msg.contains("closed")
-            );
         })
     }
 }

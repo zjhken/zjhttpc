@@ -1,10 +1,9 @@
-use anyhow::Result;
 use zjhttpc::client::ZJHttpClient;
 use zjhttpc::methods;
 use zjhttpc::requestx::Request;
 
 #[async_std::test]
-async fn test_send_get_to_datacenter() -> Result<()> {
+async fn test_send_get_to_datacenter() -> zjhttpc::Result<()> {
     let client = ZJHttpClient::builder().build().unwrap();
     let mut req = Request::new(methods::GET, "https://www.baidu.com").unwrap();
 

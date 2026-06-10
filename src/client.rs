@@ -1,4 +1,3 @@
-use anyhow_ext::{Context, Result, anyhow};
 use async_std::{
     future::{self, timeout},
     io::{ReadExt, WriteExt},
@@ -26,12 +25,14 @@ use std::{
 
 use crate::{
     body::Body,
+    error::{Result, ZjhttpcError},
     misc::TrustStorePem,
     proxy::{HttpsProxyOption, ProxyConnector},
     requestx::Request,
     response::Response,
     stream::BoxedStream,
 };
+use anyhow_ext::Context as _;
 use tracing::{error, trace};
 
 /// Connection type for pool key
@@ -223,7 +224,7 @@ pub struct ZJHttpClient {
     #[builder(default = "Arc::new(ConnectionPoolInner::new(30, 1000, Duration::from_secs(90)))")]
     pub(crate) connection_pool: ConnectionPool,
     #[builder(default)]
-    pub(crate) tls_config: std::sync::OnceLock<Arc<rustls::ClientConfig>>,
+    pub(crate) tls_config: std::sync::OnceLock<std::result::Result<Arc<rustls::ClientConfig>, ZjhttpcError>>,
 }
 
 impl std::fmt::Debug for ZJHttpClient {
@@ -260,10 +261,14 @@ impl ZJHttpClient {
         }
     }
 
-    pub(crate) fn tls_config(&self) -> Arc<rustls::ClientConfig> {
-        self.tls_config.get_or_init(|| {
-            Arc::new(create_tls_config(&self.global_trust_store_pem).expect("failed to create TLS config"))
-        }).clone()
+    pub(crate) fn tls_config(&self) -> Result<Arc<rustls::ClientConfig>> {
+        let result = self.tls_config.get_or_init(|| {
+            create_tls_config(&self.global_trust_store_pem).map(Arc::new)
+        });
+        match result {
+            Ok(config) => Ok(config.clone()),
+            Err(e) => Err(e.clone()),
+        }
     }
 
     pub fn set_proxy(mut self, proxy: HttpsProxyOption) -> Self {
@@ -350,10 +355,8 @@ impl ZJHttpClient {
         addr: SocketAddr,
     ) -> Result<Response> {
         send_body(req, &mut stream_to_write).await.dot()?;
-        let resp = read_headers_to_resp(self, req, stream_to_write, addr)
-            .await
-            .dot()?;
-        return Ok(resp);
+        let resp = read_headers_to_resp(self, req, stream_to_write, addr).await.dot()?;
+        Ok(resp)
     }
 }
 
@@ -385,24 +388,24 @@ async fn pick_or_connect_stream(
         }
 
         let proxy_connector = if let Some(trust_store) = &req.trust_store_pem {
-            ProxyConnector::new_with_trust_store(proxy_option.clone(), &Some(trust_store.clone()))?
+            ProxyConnector::new_with_trust_store(proxy_option.clone(), &Some(trust_store.clone())).dot()?
         } else {
             ProxyConnector::new_with_trust_store(
                 proxy_option.clone(),
                 &client.global_trust_store_pem,
-            )?
+            ).dot()?
         };
 
-        let target_host = req.url.host_str().ok_or(anyhow!("no host in URL"))?;
+        let target_host = req.url.host_str().ok_or(ZjhttpcError::NoHost).dot()?;
         let target_port = req
             .url
             .port_or_known_default()
-            .ok_or_else(|| anyhow!("URL must have a valid port"))?;
+            .ok_or(ZjhttpcError::NoPort).dot()?;
 
         let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
         let stream = proxy_connector
             .connect(target_host, target_port, connect_timeout)
-            .await?;
+            .await.dot()?;
         return Ok((stream, false));
     }
 
@@ -418,7 +421,7 @@ async fn pick_or_connect_stream(
                 return Ok((stream_from_pool, true));
             }
             trace!(?addr, "no existing TCP connection for this addr");
-            let stream = connect_fresh_tcp(client, req, addr).await?;
+            let stream = connect_fresh_tcp(client, req, addr).await.dot()?;
             Ok((stream, false))
         }
         "https" => {
@@ -432,10 +435,10 @@ async fn pick_or_connect_stream(
                 return Ok((stream_from_pool, true));
             }
             trace!(?addr, "no existing TLS connection for this addr");
-            let stream = connect_fresh_tls(client, req, addr).await?;
+            let stream = connect_fresh_tls(client, req, addr).await.dot()?;
             Ok((stream, false))
         }
-        others => Err(anyhow!("scheme {others} is not supported at the moment")),
+        others => Err(ZjhttpcError::UnsupportedScheme(others.to_string())),
     }
 }
 
@@ -449,7 +452,7 @@ async fn connect_fresh_stream(
     match req.url.scheme() {
         "http" => connect_fresh_tcp(client, req, addr).await,
         "https" => connect_fresh_tls(client, req, addr).await,
-        others => Err(anyhow!("scheme {others} is not supported at the moment")),
+        others => Err(ZjhttpcError::UnsupportedScheme(others.to_string())),
     }
 }
 
@@ -459,17 +462,11 @@ async fn connect_fresh_tcp(
     addr: &SocketAddr,
 ) -> Result<BoxedStream> {
     let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
-    let tcp_stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => return Err(anyhow!("TCP connection failed: {e}")),
-        Err(_) => {
-            return Err(anyhow!(
-                "TCP connection timeout after {:?}",
-                connect_timeout
-            ));
-        }
-    };
-    Ok(Box::new(tcp_stream))
+    match timeout(connect_timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => Ok(Box::new(stream)),
+        Ok(Err(e)) => Err(ZjhttpcError::Connection(format!("TCP connection failed: {e}"))),
+        Err(_) => Err(ZjhttpcError::ConnectionTimeout(connect_timeout)),
+    }
 }
 
 async fn connect_fresh_tls(
@@ -481,28 +478,26 @@ async fn connect_fresh_tls(
     let tls_config = if req.trust_store_pem.is_some() {
         Arc::new(create_tls_config(&req.trust_store_pem).dot()?)
     } else {
-        client.tls_config()
+        client.tls_config().dot()?
     };
     let tls_connector: TlsConnector = tls_config.into();
     let host = match req.url.host() {
         Some(url::Host::Domain(s)) => s,
         _ => {
-            return Err(anyhow!(
-                "HTTPS request should specify the Domain instead of IP, or you can provide the sni domain name"
+            return Err(ZjhttpcError::Tls(
+                "HTTPS request should specify the Domain instead of IP, or you can provide the sni domain name".to_string(),
             ));
         }
     };
     let tcp_stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => return Err(anyhow!("TCP connection failed: {e}")),
+        Ok(Err(e)) => return Err(ZjhttpcError::Connection(format!("TCP connection failed: {e}"))),
         Err(_) => {
-            return Err(anyhow!(
-                "TCP connection timeout after {:?}",
-                connect_timeout
-            ));
+            return Err(ZjhttpcError::ConnectionTimeout(connect_timeout));
         }
     };
-    let tls_stream = tls_connector.connect(host, tcp_stream).await.dot()?;
+    let tls_stream = tls_connector.connect(host, tcp_stream).await
+        .map_err(|e| ZjhttpcError::Tls(format!("TLS handshake failed: {e}")))?;
     Ok(Box::new(tls_stream))
 }
 
@@ -511,14 +506,15 @@ fn try_pick_from_pool(pool: &ConnectionPool, key: &ConnectionKey) -> Option<Boxe
 }
 
 async fn resolve_1st_ip(req: &mut Request) -> Result<SocketAddr> {
-    let addrs = req.url.socket_addrs(|| None).dot()?;
+    let addrs = req.url.socket_addrs(|| None)
+        .map_err(|e| ZjhttpcError::Dns(format!("failed to resolve hostname: {e}")))?;
     if addrs.is_empty() {
-        return Err(anyhow!("no result in DNS resolve"));
+        return Err(ZjhttpcError::Dns("no result in DNS resolve".to_string()));
     }
     let mut rng = rand::rng();
     let addr = addrs
         .choose(&mut rng)
-        .ok_or(anyhow!("no result in DNS resolve"))?
+        .ok_or(ZjhttpcError::Dns("no result in DNS resolve".to_string())).dot()?
         .to_owned();
     Ok(addr)
 }
@@ -526,7 +522,15 @@ async fn resolve_1st_ip(req: &mut Request) -> Result<SocketAddr> {
 pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     let certs = match trust_store {
-        None => load_native_certs().expect("failed to load system certs"),
+        None => {
+            let result = load_native_certs();
+            if !result.errors.is_empty() && result.certs.is_empty() {
+                return Err(ZjhttpcError::Certificate(format!(
+                    "failed to load system certs: {:?}", result.errors
+                )));
+            }
+            result.certs
+        }
         Some(TrustStorePem::Bytes(data)) => {
             let mut reader = std::io::BufReader::new(data.as_slice());
             rustls_pemfile::certs(&mut reader)
@@ -541,8 +545,7 @@ pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::
         }
         Some(TrustStorePem::Path(p)) => {
             let file = std::fs::File::open(p)
-                .dot()
-                .context("failed to open trust store file")?;
+                .map_err(|e| ZjhttpcError::Certificate(format!("failed to open trust store file: {e}"))).dot()?;
             let mut reader = std::io::BufReader::new(file);
             rustls_pemfile::certs(&mut reader)
                 .filter_map(|re| match re {
@@ -556,13 +559,14 @@ pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::
         }
     };
     for cert in certs {
-        root_store.add(&rustls::Certificate(cert.to_vec())).dot()?;
+        root_store.add(&rustls::Certificate(cert.to_vec()))
+            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}"))).dot()?;
     }
     let client_config = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-    return Ok(client_config);
+    Ok(client_config)
 }
 
 async fn send_header<S>(client: &ZJHttpClient, req: &Request, stream: &mut S) -> Result<()>
@@ -608,8 +612,7 @@ where
         stream.write_all(b"Content-Length: ").await.dot()?;
         stream
             .write_all(req.content_length.to_string().as_bytes())
-            .await
-            .dot()?;
+            .await.dot()?;
         stream.write_all(b"\r\n").await.dot()?;
         if let Some((username, password)) = &req.basic_auth {
             let encoded = base64_simd::STANDARD.encode_to_string(format!("{username}:{password}"));
@@ -623,8 +626,7 @@ where
 
         stream
             .write_all(b"Connection: keep-alive\r\n")
-            .await
-            .dot()?;
+            .await.dot()?;
         stream.write_all(b"\r\n").await.dot()?;
         stream.flush().await.dot()?;
 
@@ -632,15 +634,16 @@ where
             let mut buf = [0u8; 1024];
             let n = stream.read(&mut buf).await.dot()?;
             if n == 0 {
-                return Err(anyhow!(
-                    "stream closed before read the 100 continue response"
+                return Err(ZjhttpcError::Connection(
+                    "stream closed before read the 100 continue response".to_string(),
                 ));
             }
             let resp = std::str::from_utf8(&buf[0..n])
-                .dot()
-                .context("resp after expect 100 is not utf8")?;
-            if resp != "HTTP/1.1 100 Continue\r\n\r\n" {
-                return Err(anyhow!("received non-100-continue resp={resp}"));
+                .map_err(|e| ZjhttpcError::InvalidResponse(format!("resp after expect 100 is not utf8: {e}"))).dot()?;
+            if !resp.starts_with("HTTP/1.") || !resp.contains(" 100 ") {
+                return Err(ZjhttpcError::InvalidResponse(format!(
+                    "received non-100-continue resp={resp}"
+                )));
             }
         }
         Ok(())
@@ -648,7 +651,7 @@ where
 
     match future::timeout(timeout_dur, send_future).await {
         Ok(result) => result,
-        Err(_) => Err(anyhow!("send header timeout after {:?}", timeout_dur)),
+        Err(_) => Err(ZjhttpcError::SendHeaderTimeout(timeout_dur)),
     }
 }
 
@@ -706,8 +709,7 @@ where
                                 )
                                 .as_bytes(),
                             )
-                            .await
-                            .dot()?;
+                            .await.dot()?;
                         stream_to_write.write_all(value.as_bytes()).await.dot()?;
                         stream_to_write.write_all(b"\r\n").await.dot()?;
                     }
@@ -739,8 +741,7 @@ where
                             .await.dot()?;
                         stream_to_write
                             .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
-                            .await
-                            .dot()?;
+                            .await.dot()?;
 
                         // Read and write file content
                         let mut file = async_std::fs::File::open(path).await.dot()?;
@@ -777,8 +778,7 @@ where
                             .await.dot()?;
                         stream_to_write
                             .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
-                            .await
-                            .dot()?;
+                            .await.dot()?;
 
                         // Read and write file content
                         let mut file = file;
@@ -815,8 +815,7 @@ where
                             .await.dot()?;
                         stream_to_write
                             .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
-                            .await
-                            .dot()?;
+                            .await.dot()?;
 
                         // Read and write stream content
                         let mut buf = vec![0u8; 1024 * 64]; // 64KB buffer
@@ -856,24 +855,27 @@ async fn read_headers_to_resp(
         let dur = req
             .read_header_timeout
             .unwrap_or(client.global_read_header_timeout);
-        future::timeout(dur, fut).await.dot()??
+        match future::timeout(dur, fut).await {
+            Ok(result) => result.dot()?,
+            Err(_) => return Err(ZjhttpcError::ReadHeaderTimeout(dur)),
+        }
     };
 
-    let input = std::str::from_utf8(&all_headers).dot()?;
+    let input = std::str::from_utf8(&all_headers)
+        .map_err(|e| ZjhttpcError::InvalidResponse(format!("response headers are not valid UTF-8: {e}"))).dot()?;
 
     // Parse the first line (status line)
     let (remaining, (_, http_version, _, status_code, _)) = parse_resp_first_line(input)
         .map_err(|e| {
-            anyhow!(
-                "{err}:parse resp first line failed. data={input}",
-                err = e.to_owned(),
-            )
-        })
-        .dot()?;
+            ZjhttpcError::InvalidResponse(format!(
+                "parse resp first line failed: {}. data={input}",
+                e.to_owned(),
+            ))
+        }).dot()?;
 
     // Parse the remaining headers
     let headers = parse_headers(remaining)
-        .dot()?
+        .map_err(|e| ZjhttpcError::InvalidResponse(e.to_string())).dot()?
         .into_iter()
         .map(|(key, value)| (key.to_ascii_lowercase(), value.to_owned()))
         .collect::<Vec<_>>();
@@ -881,7 +883,7 @@ async fn read_headers_to_resp(
     // Determine read body timeout (request-level takes precedence over client-level)
     let read_body_timeout = req.read_body_timeout.or(client.global_read_body_timeout);
 
-    return Response::new_from_parse_result(
+    Ok(Response::new_from_parse_result(
         http_version,
         status_code,
         headers,
@@ -893,22 +895,21 @@ async fn read_headers_to_resp(
         &overflow[..overflow_len],
         Some(client.connection_pool.clone()),
     )
-    .map_err(|e| anyhow!("{e}"));
+    .map_err(|e| ZjhttpcError::InvalidResponse(e.to_string())).dot()?)
 }
 
-fn parse_headers(input: &str) -> Result<Vec<(&str, &str)>> {
+fn parse_headers(input: &str) -> std::result::Result<Vec<(&str, &str)>, ZjhttpcError> {
     let mut vec = vec![];
     let mut rest: &str = input;
     loop {
         let (out, (key, _, value, _)) = parse_one_line_header(rest)
             .map_err(|e| {
-                anyhow!(
-                    "{err}:failed to parse one line header. line={line}",
-                    err = e.to_owned(),
-                    line = input.to_string()
-                )
-            })
-            .dot()?;
+                ZjhttpcError::InvalidResponse(format!(
+                    "failed to parse one line header: {}. line={}",
+                    e.to_owned(),
+                    input.to_string()
+                ))
+            }).dot()?;
         rest = out;
         vec.push((key, value));
         if rest == "\r\n" {
@@ -961,20 +962,19 @@ where
     loop {
         let n = stream.read(&mut tmp).await.dot()?;
         if n == 0 {
-            return Err(anyhow!(
+            return Err(ZjhttpcError::UnexpectedEof(format!(
                 "unexpected EOF while reading until delimiter (read {} bytes)",
                 buf.len()
-            ));
+            )));
         }
 
         buf.extend_from_slice(&tmp[..n]);
 
         if buf.len() > max_bytes {
-            return Err(anyhow!(
-                "read_until exceeded max_bytes limit ({} > {})",
-                buf.len(),
-                max_bytes
-            ));
+            return Err(ZjhttpcError::ResponseTooLarge {
+                actual: buf.len(),
+                max: max_bytes,
+            });
         }
 
         // Search the tail that could contain a straddling delimiter
@@ -1290,7 +1290,6 @@ mod tests {
 
     #[async_std::test]
     async fn test_read_until_http_headers_complete() {
-        // This is the key test - reading complete HTTP headers until \r\n\r\n
         let data = b"HTTP/1.1 200 OK\r\n\
                      Content-Type: application/json\r\n\
                      Content-Length: 1234\r\n\
@@ -1303,7 +1302,6 @@ mod tests {
         let (buf, _, _) = result.unwrap();
         let text = std::str::from_utf8(&buf).unwrap();
 
-        // Verify we got all headers but not the body
         assert!(text.contains("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains("Content-Type: application/json\r\n"));
         assert!(text.contains("Content-Length: 1234\r\n"));
@@ -1353,7 +1351,6 @@ mod tests {
 
     #[async_std::test]
     async fn test_read_until_http_headers_multiline_value() {
-        // Test with folded header values (deprecated but still valid in some cases)
         let data = b"HTTP/1.1 200 OK\r\n\
                      Content-Type: text/html\r\n\
                      X-Custom: line1\r\n\
@@ -1371,7 +1368,6 @@ mod tests {
 
     #[async_std::test]
     async fn test_read_until_http_headers_many_headers() {
-        // Test with many headers to ensure buffer can handle it
         let mut data = String::from("HTTP/1.1 200 OK\r\n");
         for i in 0..50 {
             data.push_str(&format!("X-Header-{}: value{}\r\n", i, i));

@@ -1,21 +1,20 @@
+use async_std::fs::File;
+use futures::io::BufReader;
 use hashbrown::HashMap;
 use indexmap::IndexSet;
 use serde::Serialize;
 use std::borrow::Cow;
-use url::Url;
-
-use anyhow_ext::{Context, Result};
-use async_std::fs::File;
-use futures::io::BufReader;
 use std::time::Duration;
+use url::Url;
 
 use crate::{
     body::{Body, BodyForm, BodyMultipartForm},
     cookie::Cookie,
-    error::ZjhttpcError,
+    error::{Result, ZjhttpcError},
     misc::TrustStorePem,
     proxy::HttpsProxyOption,
 };
+use anyhow_ext::Context as _;
 
 pub struct Request {
     pub method: &'static str,
@@ -40,7 +39,7 @@ impl Request {
     #[must_use]
     pub fn new(method: &'static str, url: impl AsRef<str>) -> Result<Self> {
         let url: Url = url.as_ref().parse()?;
-        let host = url.host_str().ok_or_else(|| ZjhttpcError::NoHost).dot()?;
+        let host = url.host_str().ok_or(ZjhttpcError::NoHost)?;
         let mut headers = HashMap::new();
         headers.insert("host".to_owned(), IndexSet::from([host.to_owned()]));
         headers.insert("user-agent".to_owned(), IndexSet::from([format!("zjhttpc/{LIB_VERSION} (powered by Jinhui)")]));
@@ -129,7 +128,7 @@ impl Request {
     }
 
     pub fn set_queries_serde(mut self, queries: &impl Serialize) -> Result<Self> {
-        let s = serde_qs::to_string(queries).dot()?;
+        let s = serde_qs::to_string(queries)?;
         self.url.set_query(Some(s.as_str()));
         Ok(self)
     }
