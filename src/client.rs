@@ -32,7 +32,7 @@ use crate::{
     response::Response,
     stream::BoxedStream,
 };
-use anyhow_ext::Context as _;
+
 use tracing::{error, trace};
 
 /// Connection type for pool key
@@ -293,8 +293,8 @@ impl ZJHttpClient {
     }
 
     pub async fn send(&self, req: &mut Request) -> Result<Response> {
-        let addr = resolve_1st_ip(req).await.dot()?;
-        let (mut stream, reused) = pick_or_connect_stream(self, &req, &addr).await.dot()?;
+        let addr = resolve_1st_ip(req).await?;
+        let (mut stream, reused) = pick_or_connect_stream(self, &req, &addr).await?;
 
         // If send_header fails on a reused (pooled) connection, it's likely stale.
         // Retry once with a fresh connection — body hasn't been consumed yet, so retry is safe.
@@ -304,14 +304,14 @@ impl ZJHttpClient {
                     "pooled connection failed during send_header, retrying with fresh connection"
                 );
                 drop(stream);
-                stream = connect_fresh_stream(self, &req, &addr).await.dot()?;
-                send_header(self, req, &mut stream).await.dot()?;
+                stream = connect_fresh_stream(self, &req, &addr).await?;
+                send_header(self, req, &mut stream).await?;
             } else {
                 return Err(e);
             }
         }
 
-        send_body(req, &mut stream).await.dot()?;
+        send_body(req, &mut stream).await?;
         match read_headers_to_resp(self, req, stream, addr).await {
             Ok(resp) => Ok(resp),
             Err(e) if reused && !matches!(req.body, Body::Stream(_)) => {
@@ -319,9 +319,9 @@ impl ZJHttpClient {
                     "pooled connection failed during read_headers_to_resp, retrying with fresh connection: {e:#}"
                 );
                 let mut stream =
-                    connect_fresh_stream(self, &req, &addr).await.dot()?;
-                send_header(self, req, &mut stream).await.dot()?;
-                send_body(req, &mut stream).await.dot()?;
+                    connect_fresh_stream(self, &req, &addr).await?;
+                send_header(self, req, &mut stream).await?;
+                send_body(req, &mut stream).await?;
                 read_headers_to_resp(self, req, stream, addr).await
             }
             Err(e) => Err(e),
@@ -329,8 +329,8 @@ impl ZJHttpClient {
     }
 
     pub async fn send_header_only(&self, req: &mut Request) -> Result<(BoxedStream, SocketAddr)> {
-        let addr = resolve_1st_ip(req).await.dot()?;
-        let (mut stream, reused) = pick_or_connect_stream(self, &req, &addr).await.dot()?;
+        let addr = resolve_1st_ip(req).await?;
+        let (mut stream, reused) = pick_or_connect_stream(self, &req, &addr).await?;
 
         if let Err(e) = send_header(self, req, &mut stream).await {
             if reused {
@@ -338,8 +338,8 @@ impl ZJHttpClient {
                     "pooled connection failed during send_header, retrying with fresh connection"
                 );
                 drop(stream);
-                stream = connect_fresh_stream(self, &req, &addr).await.dot()?;
-                send_header(self, req, &mut stream).await.dot()?;
+                stream = connect_fresh_stream(self, &req, &addr).await?;
+                send_header(self, req, &mut stream).await?;
             } else {
                 return Err(e);
             }
@@ -354,8 +354,8 @@ impl ZJHttpClient {
         mut stream_to_write: BoxedStream,
         addr: SocketAddr,
     ) -> Result<Response> {
-        send_body(req, &mut stream_to_write).await.dot()?;
-        let resp = read_headers_to_resp(self, req, stream_to_write, addr).await.dot()?;
+        send_body(req, &mut stream_to_write).await?;
+        let resp = read_headers_to_resp(self, req, stream_to_write, addr).await?;
         Ok(resp)
     }
 }
@@ -388,24 +388,24 @@ async fn pick_or_connect_stream(
         }
 
         let proxy_connector = if let Some(trust_store) = &req.trust_store_pem {
-            ProxyConnector::new_with_trust_store(proxy_option.clone(), &Some(trust_store.clone())).dot()?
+            ProxyConnector::new_with_trust_store(proxy_option.clone(), &Some(trust_store.clone()))?
         } else {
             ProxyConnector::new_with_trust_store(
                 proxy_option.clone(),
                 &client.global_trust_store_pem,
-            ).dot()?
+            )?
         };
 
-        let target_host = req.url.host_str().ok_or(ZjhttpcError::NoHost).dot()?;
+        let target_host = req.url.host_str().ok_or(ZjhttpcError::NoHost)?;
         let target_port = req
             .url
             .port_or_known_default()
-            .ok_or(ZjhttpcError::NoPort).dot()?;
+            .ok_or(ZjhttpcError::NoPort)?;
 
         let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
         let stream = proxy_connector
             .connect(target_host, target_port, connect_timeout)
-            .await.dot()?;
+            .await?;
         return Ok((stream, false));
     }
 
@@ -421,7 +421,7 @@ async fn pick_or_connect_stream(
                 return Ok((stream_from_pool, true));
             }
             trace!(?addr, "no existing TCP connection for this addr");
-            let stream = connect_fresh_tcp(client, req, addr).await.dot()?;
+            let stream = connect_fresh_tcp(client, req, addr).await?;
             Ok((stream, false))
         }
         "https" => {
@@ -435,7 +435,7 @@ async fn pick_or_connect_stream(
                 return Ok((stream_from_pool, true));
             }
             trace!(?addr, "no existing TLS connection for this addr");
-            let stream = connect_fresh_tls(client, req, addr).await.dot()?;
+            let stream = connect_fresh_tls(client, req, addr).await?;
             Ok((stream, false))
         }
         others => Err(ZjhttpcError::UnsupportedScheme(others.to_string())),
@@ -476,9 +476,9 @@ async fn connect_fresh_tls(
 ) -> Result<BoxedStream> {
     let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
     let tls_config = if req.trust_store_pem.is_some() {
-        Arc::new(create_tls_config(&req.trust_store_pem).dot()?)
+        Arc::new(create_tls_config(&req.trust_store_pem)?)
     } else {
-        client.tls_config().dot()?
+        client.tls_config()?
     };
     let tls_connector: TlsConnector = tls_config.into();
     let host = match req.url.host() {
@@ -514,7 +514,7 @@ async fn resolve_1st_ip(req: &mut Request) -> Result<SocketAddr> {
     let mut rng = rand::rng();
     let addr = addrs
         .choose(&mut rng)
-        .ok_or(ZjhttpcError::Dns("no result in DNS resolve".to_string())).dot()?
+        .ok_or(ZjhttpcError::Dns("no result in DNS resolve".to_string()))?
         .to_owned();
     Ok(addr)
 }
@@ -545,7 +545,7 @@ pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::
         }
         Some(TrustStorePem::Path(p)) => {
             let file = std::fs::File::open(p)
-                .map_err(|e| ZjhttpcError::Certificate(format!("failed to open trust store file: {e}"))).dot()?;
+                .map_err(|e| ZjhttpcError::Certificate(format!("failed to open trust store file: {e}")))?;
             let mut reader = std::io::BufReader::new(file);
             rustls_pemfile::certs(&mut reader)
                 .filter_map(|re| match re {
@@ -560,7 +560,7 @@ pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::
     };
     for cert in certs {
         root_store.add(&rustls::Certificate(cert.to_vec()))
-            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}"))).dot()?;
+            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}")))?;
     }
     let client_config = rustls::ClientConfig::builder()
         .with_safe_defaults()
@@ -578,23 +578,23 @@ where
         .send_header_timeout
         .unwrap_or(client.global_send_header_timeout);
     let send_future = async {
-        stream.write_all(req.method.as_bytes()).await.dot()?;
-        stream.write_all(b" ").await.dot()?;
+        stream.write_all(req.method.as_bytes()).await?;
+        stream.write_all(b" ").await?;
         let path = req.url.path();
-        stream.write_all(path.as_bytes()).await.dot()?;
+        stream.write_all(path.as_bytes()).await?;
         if let Some(q) = req.url.query() {
-            stream.write_all(b"?").await.dot()?;
-            stream.write_all(q.as_bytes()).await.dot()?;
+            stream.write_all(b"?").await?;
+            stream.write_all(q.as_bytes()).await?;
         }
-        stream.write_all(b" ").await.dot()?;
-        stream.write_all(b"HTTP/1.1\r\n").await.dot()?;
+        stream.write_all(b" ").await?;
+        stream.write_all(b"HTTP/1.1\r\n").await?;
         // insert headers
         for (key, values) in &req.headers {
             for value in values {
-                stream.write_all(key.as_bytes()).await.dot()?;
-                stream.write_all(b": ").await.dot()?;
-                stream.write_all(value.as_bytes()).await.dot()?;
-                stream.write_all(b"\r\n").await.dot()?;
+                stream.write_all(key.as_bytes()).await?;
+                stream.write_all(b": ").await?;
+                stream.write_all(value.as_bytes()).await?;
+                stream.write_all(b"\r\n").await?;
             }
         }
         // Write Content-Type if set and user hasn't manually set it in headers
@@ -604,42 +604,42 @@ where
                 .keys()
                 .any(|k| k.eq_ignore_ascii_case("content-type"));
             if !already_set {
-                stream.write_all(b"Content-Type: ").await.dot()?;
-                stream.write_all(ct.as_bytes()).await.dot()?;
-                stream.write_all(b"\r\n").await.dot()?;
+                stream.write_all(b"Content-Type: ").await?;
+                stream.write_all(ct.as_bytes()).await?;
+                stream.write_all(b"\r\n").await?;
             }
         }
-        stream.write_all(b"Content-Length: ").await.dot()?;
+        stream.write_all(b"Content-Length: ").await?;
         stream
             .write_all(req.content_length.to_string().as_bytes())
-            .await.dot()?;
-        stream.write_all(b"\r\n").await.dot()?;
+            .await?;
+        stream.write_all(b"\r\n").await?;
         if let Some((username, password)) = &req.basic_auth {
             let encoded = base64_simd::STANDARD.encode_to_string(format!("{username}:{password}"));
             let s = format!("Authorization: Basic {encoded}\r\n");
-            stream.write_all(s.as_bytes()).await.dot()?;
+            stream.write_all(s.as_bytes()).await?;
         }
 
         if req.expect_continue {
-            stream.write_all(b"Expect: 100-continue\r\n").await.dot()?;
+            stream.write_all(b"Expect: 100-continue\r\n").await?;
         }
 
         stream
             .write_all(b"Connection: keep-alive\r\n")
-            .await.dot()?;
-        stream.write_all(b"\r\n").await.dot()?;
-        stream.flush().await.dot()?;
+            .await?;
+        stream.write_all(b"\r\n").await?;
+        stream.flush().await?;
 
         if req.expect_continue {
             let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).await.dot()?;
+            let n = stream.read(&mut buf).await?;
             if n == 0 {
                 return Err(ZjhttpcError::Connection(
                     "stream closed before read the 100 continue response".to_string(),
                 ));
             }
             let resp = std::str::from_utf8(&buf[0..n])
-                .map_err(|e| ZjhttpcError::InvalidResponse(format!("resp after expect 100 is not utf8: {e}"))).dot()?;
+                .map_err(|e| ZjhttpcError::InvalidResponse(format!("resp after expect 100 is not utf8: {e}")))?;
             if !resp.starts_with("HTTP/1.") || !resp.contains(" 100 ") {
                 return Err(ZjhttpcError::InvalidResponse(format!(
                     "received non-100-continue resp={resp}"
@@ -666,13 +666,13 @@ where
             let mut buf = vec![0u8; 1024 * 128]; // 128KB
             let mut read_n = 0usize;
             loop {
-                let n = stream_to_read.read(&mut buf).await.dot()?;
+                let n = stream_to_read.read(&mut buf).await?;
                 if n == 0 {
                     trace!(n, "read stream ended");
                     break;
                 }
                 read_n += n;
-                stream_to_write.write_all(&buf[..n]).await.dot()?;
+                stream_to_write.write_all(&buf[..n]).await?;
                 if read_n == len {
                     trace!("sent enough bytes");
                     break;
@@ -680,10 +680,10 @@ where
             }
         }
         Body::Str(s) => {
-            stream_to_write.write_all(s.as_bytes()).await.dot()?;
+            stream_to_write.write_all(s.as_bytes()).await?;
         }
         Body::Bytes(bytes) => {
-            stream_to_write.write_all(&bytes).await.dot()?;
+            stream_to_write.write_all(&bytes).await?;
         }
         Body::MultipartForm(form) => {
             // Serialize multipart form data
@@ -695,9 +695,9 @@ where
 
             for field in fields {
                 // Write boundary
-                stream_to_write.write_all(b"--").await.dot()?;
-                stream_to_write.write_all(boundary_bytes).await.dot()?;
-                stream_to_write.write_all(b"\r\n").await.dot()?;
+                stream_to_write.write_all(b"--").await?;
+                stream_to_write.write_all(boundary_bytes).await?;
+                stream_to_write.write_all(b"\r\n").await?;
 
                 match field {
                     crate::body::MultipartField::Text(name, value) => {
@@ -709,9 +709,9 @@ where
                                 )
                                 .as_bytes(),
                             )
-                            .await.dot()?;
-                        stream_to_write.write_all(value.as_bytes()).await.dot()?;
-                        stream_to_write.write_all(b"\r\n").await.dot()?;
+                            .await?;
+                        stream_to_write.write_all(value.as_bytes()).await?;
+                        stream_to_write.write_all(b"\r\n").await?;
                     }
                     crate::body::MultipartField::FilePath(
                         name,
@@ -738,22 +738,22 @@ where
                                 "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
                                 name, filename
                             ).as_bytes())
-                            .await.dot()?;
+                            .await?;
                         stream_to_write
                             .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
-                            .await.dot()?;
+                            .await?;
 
                         // Read and write file content
-                        let mut file = async_std::fs::File::open(path).await.dot()?;
+                        let mut file = async_std::fs::File::open(path).await?;
                         let mut buf = vec![0u8; 1024 * 64]; // 64KB buffer
                         loop {
-                            let n = file.read(&mut buf).await.dot()?;
+                            let n = file.read(&mut buf).await?;
                             if n == 0 {
                                 break;
                             }
-                            stream_to_write.write_all(&buf[..n]).await.dot()?;
+                            stream_to_write.write_all(&buf[..n]).await?;
                         }
-                        stream_to_write.write_all(b"\r\n").await.dot()?;
+                        stream_to_write.write_all(b"\r\n").await?;
                     }
                     crate::body::MultipartField::File(
                         name,
@@ -775,22 +775,22 @@ where
                                 "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
                                 name, filename
                             ).as_bytes())
-                            .await.dot()?;
+                            .await?;
                         stream_to_write
                             .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
-                            .await.dot()?;
+                            .await?;
 
                         // Read and write file content
                         let mut file = file;
                         let mut buf = vec![0u8; 1024 * 64]; // 64KB buffer
                         loop {
-                            let n = file.read(&mut buf).await.dot()?;
+                            let n = file.read(&mut buf).await?;
                             if n == 0 {
                                 break;
                             }
-                            stream_to_write.write_all(&buf[..n]).await.dot()?;
+                            stream_to_write.write_all(&buf[..n]).await?;
                         }
-                        stream_to_write.write_all(b"\r\n").await.dot()?;
+                        stream_to_write.write_all(b"\r\n").await?;
                     }
                     crate::body::MultipartField::Stream(
                         name,
@@ -812,29 +812,29 @@ where
                                 "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
                                 name, filename
                             ).as_bytes())
-                            .await.dot()?;
+                            .await?;
                         stream_to_write
                             .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
-                            .await.dot()?;
+                            .await?;
 
                         // Read and write stream content
                         let mut buf = vec![0u8; 1024 * 64]; // 64KB buffer
                         loop {
-                            let n = stream.read(&mut buf).await.dot()?;
+                            let n = stream.read(&mut buf).await?;
                             if n == 0 {
                                 break;
                             }
-                            stream_to_write.write_all(&buf[..n]).await.dot()?;
+                            stream_to_write.write_all(&buf[..n]).await?;
                         }
-                        stream_to_write.write_all(b"\r\n").await.dot()?;
+                        stream_to_write.write_all(b"\r\n").await?;
                     }
                 }
             }
 
             // Write final boundary
-            stream_to_write.write_all(b"--").await.dot()?;
-            stream_to_write.write_all(boundary_bytes).await.dot()?;
-            stream_to_write.write_all(b"--\r\n").await.dot()?;
+            stream_to_write.write_all(b"--").await?;
+            stream_to_write.write_all(boundary_bytes).await?;
+            stream_to_write.write_all(b"--\r\n").await?;
         }
     }
     Ok(())
@@ -856,13 +856,13 @@ async fn read_headers_to_resp(
             .read_header_timeout
             .unwrap_or(client.global_read_header_timeout);
         match future::timeout(dur, fut).await {
-            Ok(result) => result.dot()?,
+            Ok(result) => result?,
             Err(_) => return Err(ZjhttpcError::ReadHeaderTimeout(dur)),
         }
     };
 
     let input = std::str::from_utf8(&all_headers)
-        .map_err(|e| ZjhttpcError::InvalidResponse(format!("response headers are not valid UTF-8: {e}"))).dot()?;
+        .map_err(|e| ZjhttpcError::InvalidResponse(format!("response headers are not valid UTF-8: {e}")))?;
 
     // Parse the first line (status line)
     let (remaining, (_, http_version, _, status_code, _)) = parse_resp_first_line(input)
@@ -871,11 +871,11 @@ async fn read_headers_to_resp(
                 "parse resp first line failed: {}. data={input}",
                 e.to_owned(),
             ))
-        }).dot()?;
+        })?;
 
     // Parse the remaining headers
     let headers = parse_headers(remaining)
-        .map_err(|e| ZjhttpcError::InvalidResponse(e.to_string())).dot()?
+        .map_err(|e| ZjhttpcError::InvalidResponse(e.to_string()))?
         .into_iter()
         .map(|(key, value)| (key.to_ascii_lowercase(), value.to_owned()))
         .collect::<Vec<_>>();
@@ -883,7 +883,7 @@ async fn read_headers_to_resp(
     // Determine read body timeout (request-level takes precedence over client-level)
     let read_body_timeout = req.read_body_timeout.or(client.global_read_body_timeout);
 
-    Ok(Response::new_from_parse_result(
+    Response::new_from_parse_result(
         http_version,
         status_code,
         headers,
@@ -895,7 +895,7 @@ async fn read_headers_to_resp(
         &overflow[..overflow_len],
         Some(client.connection_pool.clone()),
     )
-    .map_err(|e| ZjhttpcError::InvalidResponse(e.to_string())).dot()?)
+    .map_err(|e| ZjhttpcError::InvalidResponse(e.to_string()))
 }
 
 fn parse_headers(input: &str) -> std::result::Result<Vec<(&str, &str)>, ZjhttpcError> {
@@ -909,7 +909,7 @@ fn parse_headers(input: &str) -> std::result::Result<Vec<(&str, &str)>, ZjhttpcE
                     e.to_owned(),
                     input.to_string()
                 ))
-            }).dot()?;
+            })?;
         rest = out;
         vec.push((key, value));
         if rest == "\r\n" {
@@ -960,7 +960,7 @@ where
     }
 
     loop {
-        let n = stream.read(&mut tmp).await.dot()?;
+        let n = stream.read(&mut tmp).await?;
         if n == 0 {
             return Err(ZjhttpcError::UnexpectedEof(format!(
                 "unexpected EOF while reading until delimiter (read {} bytes)",

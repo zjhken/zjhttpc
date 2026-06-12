@@ -4,7 +4,6 @@ use hashbrown::HashMap;
 use indexmap::IndexSet;
 use std::net::SocketAddr;
 
-use anyhow_ext::Context as _;
 use tracing::error;
 
 use crate::{
@@ -641,7 +640,7 @@ impl Response {
 
             // Apply read body timeout if set
             let read_future = async {
-                while let n = stream.read(&mut buf).await.dot()?
+                while let n = stream.read(&mut buf).await?
                     && n > 0
                 {
                     bytes.extend_from_slice(&buf[..n]);
@@ -653,9 +652,9 @@ impl Response {
                 async_std::future::timeout(timeout, read_future)
                     .await
                     .map_err(|_| ZjhttpcError::ReadBodyTimeout(timeout))
-                    .dot()??;
+                    ??;
             } else {
-                read_future.await.dot()?;
+                read_future.await?;
             }
 
             // considering the encoding
@@ -767,7 +766,7 @@ impl Response {
 
             // Apply read body timeout if set
             let read_future = async {
-                while let n = stream.read(&mut buf).await.dot()?
+                while let n = stream.read(&mut buf).await?
                     && n > 0
                 {
                     bytes.extend_from_slice(&buf[..n]);
@@ -779,9 +778,9 @@ impl Response {
                 async_std::future::timeout(timeout, read_future)
                     .await
                     .map_err(|_| ZjhttpcError::ReadBodyTimeout(timeout))
-                    .dot()??;
+                    ??;
             } else {
-                read_future.await.dot()?;
+                read_future.await?;
             }
 
             Ok(bytes)
@@ -792,7 +791,7 @@ impl Response {
 
     // reading the entire body and return a JSON object
     pub async fn body_json(&mut self) -> Result<serde_json::Value> {
-        let bytes = self.body_bytes().await.dot()?;
+        let bytes = self.body_bytes().await?;
         serde_json::from_slice(&bytes).map_err(|e| {
             let preview = String::from_utf8_lossy(&bytes);
             let preview = if preview.len() > 200 {

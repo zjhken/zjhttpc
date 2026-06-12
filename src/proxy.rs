@@ -17,8 +17,6 @@ use crate::error::{Result, ZjhttpcError};
 use crate::misc::TrustStorePem;
 use crate::stream::BoxedStream;
 
-use anyhow_ext::Context as _;
-
 #[derive(Clone, Debug)]
 pub struct HttpsProxyOption {
     pub url: Url,
@@ -37,7 +35,7 @@ impl HttpsProxyOption {
         let url: Url = proxy_url
             .as_ref()
             .parse()
-            .map_err(|e| ZjhttpcError::InvalidUrl(e)).dot()?;
+            .map_err(|e| ZjhttpcError::InvalidUrl(e))?;
 
         if url.scheme() != "http" && url.scheme() != "https" {
             return Err(ZjhttpcError::Proxy("proxy URL must use http or https scheme".to_string()));
@@ -45,10 +43,10 @@ impl HttpsProxyOption {
 
         let host = url
             .host_str()
-            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string())).dot()?;
+            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string()))?;
         let port = url
             .port_or_known_default()
-            .ok_or(ZjhttpcError::NoPort).dot()?;
+            .ok_or(ZjhttpcError::NoPort)?;
 
         let addrs = format!("{}:{}", host, port)
             .parse::<SocketAddr>()
@@ -58,11 +56,11 @@ impl HttpsProxyOption {
                     Ok(SocketAddr::from(([127, 0, 0, 1], port)))
                 } else {
                     std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-                        .map_err(|e| ZjhttpcError::Dns(format!("failed to resolve proxy address: {e}"))).dot()?
+                        .map_err(|e| ZjhttpcError::Dns(format!("failed to resolve proxy address: {e}")))?
                         .next()
                         .ok_or(ZjhttpcError::Dns("no proxy addresses found".to_string()))
                 }
-            }).dot()?;
+            })?;
 
         let cred = if !url.username().is_empty() || url.password().is_some() {
             Some(Cred {
@@ -83,10 +81,10 @@ impl HttpsProxyOption {
     pub fn from_url(url: Url) -> Result<Self> {
         let host = url
             .host_str()
-            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string())).dot()?;
+            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string()))?;
         let port = url
             .port_or_known_default()
-            .ok_or(ZjhttpcError::NoPort).dot()?;
+            .ok_or(ZjhttpcError::NoPort)?;
 
         let addrs = format!("{}:{}", host, port)
             .parse::<SocketAddr>()
@@ -95,11 +93,11 @@ impl HttpsProxyOption {
                     Ok(SocketAddr::from(([127, 0, 0, 1], port)))
                 } else {
                     std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-                        .map_err(|e| ZjhttpcError::Dns(format!("failed to resolve proxy address: {e}"))).dot()?
+                        .map_err(|e| ZjhttpcError::Dns(format!("failed to resolve proxy address: {e}")))?
                         .next()
                         .ok_or(ZjhttpcError::Dns("no proxy addresses found".to_string()))
                 }
-            }).dot()?;
+            })?;
 
         let cred = if !url.username().is_empty() || url.password().is_some() {
             Some(Cred {
@@ -189,13 +187,13 @@ impl ProxyConnector {
         tcp_stream
             .write_all(connect_request.as_bytes())
             .await
-            .map_err(|e| ZjhttpcError::Proxy(format!("failed to send CONNECT request to proxy: {e}"))).dot()?;
+            .map_err(|e| ZjhttpcError::Proxy(format!("failed to send CONNECT request to proxy: {e}")))?;
         tcp_stream
             .flush()
             .await
-            .map_err(|e| ZjhttpcError::Proxy(format!("failed to flush proxy connection: {e}"))).dot()?;
+            .map_err(|e| ZjhttpcError::Proxy(format!("failed to flush proxy connection: {e}")))?;
 
-        read_connect_response(&mut tcp_stream).await.dot()?;
+        read_connect_response(&mut tcp_stream).await?;
 
         debug!(
             "HTTP proxy CONNECT successful to {}:{}",
@@ -224,12 +222,12 @@ impl ProxyConnector {
             .proxy
             .url
             .host_str()
-            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string())).dot()?;
+            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string()))?;
 
         let tls_stream = tls_connector
             .connect(proxy_host, tcp_stream)
             .await
-            .map_err(|e| ZjhttpcError::Tls(format!("failed to establish TLS connection to HTTPS proxy: {e}"))).dot()?;
+            .map_err(|e| ZjhttpcError::Tls(format!("failed to establish TLS connection to HTTPS proxy: {e}")))?;
 
         let connect_request = format!(
             "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Connection: Keep-Alive\r\n",
@@ -251,13 +249,13 @@ impl ProxyConnector {
         stream
             .write_all(connect_request.as_bytes())
             .await
-            .map_err(|e| ZjhttpcError::Proxy(format!("failed to send CONNECT request to HTTPS proxy: {e}"))).dot()?;
+            .map_err(|e| ZjhttpcError::Proxy(format!("failed to send CONNECT request to HTTPS proxy: {e}")))?;
         stream
             .flush()
             .await
-            .map_err(|e| ZjhttpcError::Proxy(format!("failed to flush proxy connection: {e}"))).dot()?;
+            .map_err(|e| ZjhttpcError::Proxy(format!("failed to flush proxy connection: {e}")))?;
 
-        read_connect_response(&mut stream).await.dot()?;
+        read_connect_response(&mut stream).await?;
 
         debug!(
             "HTTPS proxy CONNECT successful to {}:{}",
@@ -280,7 +278,7 @@ where
         let n = stream
             .read(&mut buf[filled..])
             .await
-            .map_err(|e| ZjhttpcError::Proxy(format!("failed to read proxy CONNECT response: {e}"))).dot()?;
+            .map_err(|e| ZjhttpcError::Proxy(format!("failed to read proxy CONNECT response: {e}")))?;
         if n == 0 {
             return Err(ZjhttpcError::Proxy("proxy closed connection before responding".to_string()));
         }
@@ -309,7 +307,7 @@ fn create_proxy_tls_config() -> Result<ClientConfig> {
     for cert in certs {
         root_store
             .add(&Certificate(cert.to_vec()))
-            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}"))).dot()?;
+            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}")))?;
     }
 
     let client_config = ClientConfig::builder()
@@ -348,7 +346,7 @@ fn create_proxy_tls_config_with_trust_store(
         }
         Some(TrustStorePem::Path(p)) => {
             let file = std::fs::File::open(p)
-                .map_err(|e| ZjhttpcError::Certificate(format!("failed to open trust store file: {e}"))).dot()?;
+                .map_err(|e| ZjhttpcError::Certificate(format!("failed to open trust store file: {e}")))?;
             let mut reader = std::io::BufReader::new(file);
             rustls_pemfile::certs(&mut reader)
                 .filter_map(|re| match re {
@@ -365,7 +363,7 @@ fn create_proxy_tls_config_with_trust_store(
     for cert in certs {
         root_store
             .add(&Certificate(cert.to_vec()))
-            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}"))).dot()?;
+            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}")))?;
     }
 
     let client_config = ClientConfig::builder()

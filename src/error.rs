@@ -78,21 +78,11 @@ pub enum ZjhttpcError {
     // IO
     #[error("{0}")]
     Io(Arc<std::io::Error>),
-
-    // External / catch-all for errors propagated through .dot()
-    #[error("{0}")]
-    External(String),
 }
 
 impl From<std::io::Error> for ZjhttpcError {
     fn from(e: std::io::Error) -> Self {
         ZjhttpcError::Io(Arc::new(e))
-    }
-}
-
-impl From<anyhow_ext::Error> for ZjhttpcError {
-    fn from(e: anyhow_ext::Error) -> Self {
-        ZjhttpcError::External(format!("{e:#}"))
     }
 }
 

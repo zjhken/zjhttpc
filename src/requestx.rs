@@ -14,7 +14,6 @@ use crate::{
     misc::TrustStorePem,
     proxy::HttpsProxyOption,
 };
-use anyhow_ext::Context as _;
 
 pub struct Request {
     pub method: &'static str,
@@ -183,9 +182,9 @@ impl Request {
 
     pub async fn set_body_file(mut self, file_path: impl AsRef<std::path::Path>) -> Result<Self> {
         let p = async_std::path::PathBuf::from(file_path.as_ref());
-        let len = p.metadata().await.dot()?.len();
+        let len = p.metadata().await?.len();
         self.content_length = len;
-        let file = File::open(p).await.dot()?;
+        let file = File::open(p).await?;
         let buf_reader = BufReader::new(file);
         self.body = Body::Stream(Box::new(buf_reader));
         Ok(self)
