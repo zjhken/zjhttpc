@@ -75,6 +75,10 @@ pub enum ZjhttpcError {
     #[error("query serialization error: {0}")]
     QuerySerialize(String),
 
+    // Multipart
+    #[error("multipart content-length computation failed: {0}")]
+    MultipartContentLength(String),
+
     // IO
     #[error("{0}")]
     Io(Arc<std::io::Error>),

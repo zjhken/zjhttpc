@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Result, ZjhttpcError};
 use async_std::fs::File;
 use std::fmt;
 use std::path::PathBuf;
@@ -392,6 +392,92 @@ impl BodyMultipartForm {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
+    }
+
+    /// Check if any field is a Stream variant (unknown length).
+    #[must_use]
+    pub fn has_stream_field(&self) -> bool {
+        self.fields.iter().any(|f| matches!(f, MultipartField::Stream(..)))
+    }
+
+    /// Pre-compute the total byte length of the multipart body.
+    /// Must not be called when `has_stream_field()` is true.
+    /// The calculation mirrors exactly what `send_body` writes on the wire.
+    pub async fn compute_content_length(&self) -> Result<u64> {
+        let boundary = &self.boundary;
+        let mut total: u64 = 0;
+
+        for field in &self.fields {
+            // --{boundary}\r\n
+            total += 2 + boundary.len() as u64 + 2;
+
+            match field {
+                MultipartField::Text(name, value) => {
+                    total += format!(
+                        "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                        name
+                    ).len() as u64;
+                    total += value.len() as u64;
+                    total += 2; // \r\n
+                }
+                MultipartField::FilePath(name, path, filename_opt, content_type_opt) => {
+                    let filename = filename_opt
+                        .as_deref()
+                        .unwrap_or_else(|| {
+                            path.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("filename")
+                        });
+                    let content_type = content_type_opt
+                        .as_deref()
+                        .unwrap_or_else(|| detect_mime_type(filename));
+
+                    total += format!(
+                        "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                        name, filename
+                    ).len() as u64;
+                    total += format!("Content-Type: {}\r\n\r\n", content_type).len() as u64;
+
+                    let meta = async_std::fs::metadata(path).await
+                        .map_err(|e| ZjhttpcError::MultipartContentLength(
+                            format!("cannot read metadata for {:?}: {e}", path)
+                        ))?;
+                    total += meta.len();
+                    total += 2; // \r\n
+                }
+                MultipartField::File(name, file, filename_opt, content_type_opt) => {
+                    let filename = filename_opt
+                        .as_deref()
+                        .unwrap_or("filename");
+                    let content_type = content_type_opt
+                        .as_deref()
+                        .unwrap_or_else(|| detect_mime_type(filename));
+
+                    total += format!(
+                        "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                        name, filename
+                    ).len() as u64;
+                    total += format!("Content-Type: {}\r\n\r\n", content_type).len() as u64;
+
+                    let meta = file.metadata().await
+                        .map_err(|e| ZjhttpcError::MultipartContentLength(
+                            format!("cannot read file metadata: {e}")
+                        ))?;
+                    total += meta.len();
+                    total += 2; // \r\n
+                }
+                MultipartField::Stream(..) => {
+                    return Err(ZjhttpcError::MultipartContentLength(
+                        "cannot compute content-length for Stream fields; use chunked encoding".into()
+                    ));
+                }
+            }
+        }
+
+        // --{boundary}--\r\n
+        total += 2 + boundary.len() as u64 + 2 + 2;
+
+        Ok(total)
     }
 }
 

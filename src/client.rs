@@ -293,6 +293,8 @@ impl ZJHttpClient {
     }
 
     pub async fn send(&self, req: &mut Request) -> Result<Response> {
+        prepare_multipart_content_length(req).await?;
+
         let addr = resolve_1st_ip(req).await?;
         let (mut stream, reused) = pick_or_connect_stream(self, &req, &addr).await?;
 
@@ -354,6 +356,7 @@ impl ZJHttpClient {
         mut stream_to_write: BoxedStream,
         addr: SocketAddr,
     ) -> Result<Response> {
+        prepare_multipart_content_length(req).await?;
         send_body(req, &mut stream_to_write).await?;
         let resp = read_headers_to_resp(self, req, stream_to_write, addr).await?;
         Ok(resp)
@@ -609,11 +612,15 @@ where
                 stream.write_all(b"\r\n").await?;
             }
         }
-        stream.write_all(b"Content-Length: ").await?;
-        stream
-            .write_all(req.content_length.to_string().as_bytes())
-            .await?;
-        stream.write_all(b"\r\n").await?;
+        if req.use_chunked {
+            stream.write_all(b"Transfer-Encoding: chunked\r\n").await?;
+        } else {
+            stream.write_all(b"Content-Length: ").await?;
+            stream
+                .write_all(req.content_length.to_string().as_bytes())
+                .await?;
+            stream.write_all(b"\r\n").await?;
+        }
         if let Some((username, password)) = &req.basic_auth {
             let encoded = base64_simd::STANDARD.encode_to_string(format!("{username}:{password}"));
             let s = format!("Authorization: Basic {encoded}\r\n");
@@ -655,6 +662,49 @@ where
     }
 }
 
+async fn prepare_multipart_content_length(req: &mut Request) -> Result<()> {
+    if matches!(req.body, Body::MultipartForm(_)) && !req.use_chunked
+        && let Body::MultipartForm(form) = &req.body {
+            req.content_length = form.compute_content_length().await?;
+        }
+    Ok(())
+}
+
+async fn write_chunk<S>(stream: &mut S, data: &[u8]) -> std::io::Result<()>
+where
+    S: async_std::io::Write + Unpin + Send + Sync,
+{
+    if data.is_empty() {
+        return Ok(());
+    }
+    stream.write_all(format!("{:x}\r\n", data.len()).as_bytes()).await?;
+    stream.write_all(data).await?;
+    stream.write_all(b"\r\n").await?;
+    Ok(())
+}
+
+async fn write_chunk_terminator<S>(stream: &mut S) -> std::io::Result<()>
+where
+    S: async_std::io::Write + Unpin + Send + Sync,
+{
+    stream.write_all(b"0\r\n\r\n").await?;
+    Ok(())
+}
+
+enum WriteMode<'a, S> {
+    Raw(&'a mut S),
+    Chunked(&'a mut S),
+}
+
+impl<'a, S: async_std::io::Write + Unpin + Send + Sync> WriteMode<'a, S> {
+    async fn write_data(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            WriteMode::Raw(s) => s.write_all(data).await,
+            WriteMode::Chunked(s) => write_chunk(s, data).await,
+        }
+    }
+}
+
 async fn send_body<S>(req: &mut Request, stream_to_write: &mut S) -> Result<()>
 where
     S: async_std::io::Read + async_std::io::Write + Unpin + Send + Sync + 'static,
@@ -686,32 +736,37 @@ where
             stream_to_write.write_all(&bytes).await?;
         }
         Body::MultipartForm(form) => {
-            // Serialize multipart form data
             let boundary = form.boundary().to_string();
             let boundary_bytes = boundary.as_bytes();
 
             // Take ownership of fields to consume them
             let fields = std::mem::take(&mut form.fields);
 
+            let mut writer = if req.use_chunked {
+                WriteMode::Chunked(stream_to_write)
+            } else {
+                WriteMode::Raw(stream_to_write)
+            };
+
             for field in fields {
-                // Write boundary
-                stream_to_write.write_all(b"--").await?;
-                stream_to_write.write_all(boundary_bytes).await?;
-                stream_to_write.write_all(b"\r\n").await?;
+                // Write boundary: --{boundary}\r\n
+                let mut boundary_line = Vec::with_capacity(2 + boundary_bytes.len() + 2);
+                boundary_line.extend_from_slice(b"--");
+                boundary_line.extend_from_slice(boundary_bytes);
+                boundary_line.extend_from_slice(b"\r\n");
+                writer.write_data(&boundary_line).await?;
 
                 match field {
                     crate::body::MultipartField::Text(name, value) => {
-                        stream_to_write
-                            .write_all(
-                                format!(
-                                    "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
-                                    name
-                                )
-                                .as_bytes(),
+                        writer.write_data(
+                            format!(
+                                "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                                name
                             )
-                            .await?;
-                        stream_to_write.write_all(value.as_bytes()).await?;
-                        stream_to_write.write_all(b"\r\n").await?;
+                            .as_bytes(),
+                        ).await?;
+                        writer.write_data(value.as_bytes()).await?;
+                        writer.write_data(b"\r\n").await?;
                     }
                     crate::body::MultipartField::FilePath(
                         name,
@@ -733,14 +788,13 @@ where
                             .map(|c| c.as_str())
                             .unwrap_or_else(|| crate::body::detect_mime_type(filename));
 
-                        stream_to_write
-                            .write_all(format!(
-                                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
-                                name, filename
-                            ).as_bytes())
-                            .await?;
-                        stream_to_write
-                            .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
+                        writer.write_data(format!(
+                            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                            name, filename
+                        ).as_bytes())
+                        .await?;
+                        writer
+                            .write_data(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
                             .await?;
 
                         // Read and write file content
@@ -751,9 +805,9 @@ where
                             if n == 0 {
                                 break;
                             }
-                            stream_to_write.write_all(&buf[..n]).await?;
+                            writer.write_data(&buf[..n]).await?;
                         }
-                        stream_to_write.write_all(b"\r\n").await?;
+                        writer.write_data(b"\r\n").await?;
                     }
                     crate::body::MultipartField::File(
                         name,
@@ -770,14 +824,13 @@ where
                             .map(|c| c.as_str())
                             .unwrap_or_else(|| crate::body::detect_mime_type(filename));
 
-                        stream_to_write
-                            .write_all(format!(
-                                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
-                                name, filename
-                            ).as_bytes())
-                            .await?;
-                        stream_to_write
-                            .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
+                        writer.write_data(format!(
+                            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                            name, filename
+                        ).as_bytes())
+                        .await?;
+                        writer
+                            .write_data(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
                             .await?;
 
                         // Read and write file content
@@ -788,9 +841,9 @@ where
                             if n == 0 {
                                 break;
                             }
-                            stream_to_write.write_all(&buf[..n]).await?;
+                            writer.write_data(&buf[..n]).await?;
                         }
-                        stream_to_write.write_all(b"\r\n").await?;
+                        writer.write_data(b"\r\n").await?;
                     }
                     crate::body::MultipartField::Stream(
                         name,
@@ -807,14 +860,13 @@ where
                             .map(|c| c.as_str())
                             .unwrap_or_else(|| crate::body::detect_mime_type(filename));
 
-                        stream_to_write
-                            .write_all(format!(
-                                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
-                                name, filename
-                            ).as_bytes())
-                            .await?;
-                        stream_to_write
-                            .write_all(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
+                        writer.write_data(format!(
+                            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+                            name, filename
+                        ).as_bytes())
+                        .await?;
+                        writer
+                            .write_data(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
                             .await?;
 
                         // Read and write stream content
@@ -824,17 +876,28 @@ where
                             if n == 0 {
                                 break;
                             }
-                            stream_to_write.write_all(&buf[..n]).await?;
+                            writer.write_data(&buf[..n]).await?;
                         }
-                        stream_to_write.write_all(b"\r\n").await?;
+                        writer.write_data(b"\r\n").await?;
                     }
                 }
             }
 
-            // Write final boundary
-            stream_to_write.write_all(b"--").await?;
-            stream_to_write.write_all(boundary_bytes).await?;
-            stream_to_write.write_all(b"--\r\n").await?;
+            // Write final boundary: --{boundary}--\r\n
+            let mut final_boundary = Vec::with_capacity(2 + boundary_bytes.len() + 4);
+            final_boundary.extend_from_slice(b"--");
+            final_boundary.extend_from_slice(boundary_bytes);
+            final_boundary.extend_from_slice(b"--\r\n");
+            writer.write_data(&final_boundary).await?;
+
+            // Terminate chunked encoding
+            if req.use_chunked {
+                // Extract the stream back from WriteMode to write terminator
+                // We know it's Chunked variant because use_chunked is true
+                if let WriteMode::Chunked(s) = writer {
+                    write_chunk_terminator(s).await?;
+                }
+            }
         }
     }
     Ok(())

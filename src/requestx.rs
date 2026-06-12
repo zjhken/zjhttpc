@@ -28,6 +28,7 @@ pub struct Request {
     pub read_body_timeout: Option<Duration>,
     pub connect_timeout: Option<Duration>,
     pub body: Body,
+    pub use_chunked: bool,
     pub trust_store_pem: Option<TrustStorePem>,
     pub proxy: Option<HttpsProxyOption>,
 }
@@ -50,6 +51,7 @@ impl Request {
             content_type: None,
             basic_auth: None,
             body: Body::None,
+            use_chunked: false,
             content_length: 0,
             send_header_timeout: None,
             read_header_timeout: None,
@@ -273,9 +275,8 @@ impl Request {
             format!("multipart/form-data; boundary={}", boundary)
         ));
 
-        // For multipart forms, we can't know the content-length upfront
-        // without reading all files, so set to 0 (will use chunked encoding)
-        self.content_length = 0;
+        self.use_chunked = form.has_stream_field();
+        self.content_length = 0; // placeholder; computed at send time for non-chunked
         self.body = Body::MultipartForm(form);
 
         self
