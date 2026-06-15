@@ -509,11 +509,15 @@ pub struct Response {
     pub read_body_timeout: Option<std::time::Duration>,
     /// Connection pool to return streams to
     pool: Option<ConnectionPool>,
+    /// Whether the server indicated the connection can be reused.
+    /// False when the response contained `Connection: close`.
+    keep_alive: bool,
 }
 
 impl Drop for Response {
     fn drop(&mut self) {
-        if self.body_completion_flag.load(Ordering::Relaxed)
+        if self.keep_alive
+            && self.body_completion_flag.load(Ordering::Relaxed)
             && let (Some(stream), Some(pool)) = (self.body_raw_stream.take(), self.pool.as_ref())
         {
             let stream_info = crate::client::StreamInfo {
@@ -567,6 +571,17 @@ impl Response {
         let mut prefix_buf = [0u8; 4096];
         let prefix_len = body_prefix.len().min(4096);
         prefix_buf[..prefix_len].copy_from_slice(&body_prefix[..prefix_len]);
+
+        // Per RFC 7230 §6.6: a connection token of "close" means the connection
+        // must not be reused. HTTP/1.0 defaults to close unless "keep-alive" is sent.
+        let conn_value = headers.get("connection").and_then(|s| s.first());
+        let keep_alive = match (&http_version, conn_value) {
+            (HttpVersion::V1_1, Some(v)) => !v.to_ascii_lowercase().contains("close"),
+            (HttpVersion::V1_0, Some(v)) => v.to_ascii_lowercase().contains("keep-alive"),
+            (HttpVersion::V1_1, None) => true,
+            (HttpVersion::V1_0, None) => false,
+        };
+
         let resp = Response {
             is_tls,
             http_version,
@@ -580,6 +595,7 @@ impl Response {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout,
             pool,
+            keep_alive,
         };
         return Ok(resp);
     }
@@ -1351,6 +1367,7 @@ mod tests {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
             pool: None,
+            keep_alive: true,
         };
 
         // Test initial state
@@ -1378,6 +1395,7 @@ mod tests {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
             pool: None,
+            keep_alive: true,
         };
 
         // Initially not complete
@@ -1412,6 +1430,7 @@ mod tests {
             body_completion_flag: completion_flag.clone(),
             read_body_timeout: None,
             pool: None,
+            keep_alive: true,
         };
 
         // Initially not complete
@@ -1590,6 +1609,7 @@ mod tests {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
             pool: None,
+            keep_alive: true,
         };
 
         // Test body_bytes method
@@ -1688,6 +1708,7 @@ mod tests {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
             pool: None,
+            keep_alive: true,
         };
 
         // Test body_json method
@@ -1784,6 +1805,7 @@ mod tests {
             body_completion_flag: Arc::new(AtomicBool::new(false)),
             read_body_timeout: None,
             pool: None,
+            keep_alive: true,
         };
 
         // Test body_json method with invalid JSON
