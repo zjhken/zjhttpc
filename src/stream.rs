@@ -22,6 +22,7 @@ impl<T: Any + RWStream> AsAny for T {
 
 impl RWStream for TcpStream {}
 impl RWStream for TlsStream<TcpStream> {}
+impl RWStream for TlsStream<BoxedStream> {}
 pub trait AnyStream: RWStream + AsAny {}
 impl<T: RWStream + AsAny> AnyStream for T {}
 pub type BoxedStream = Box<dyn AnyStream>;
@@ -101,4 +102,3 @@ impl io::Read for SliceRead {
         Poll::Ready(Ok(n))
     }
 }
-

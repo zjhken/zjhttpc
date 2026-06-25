@@ -409,6 +409,14 @@ async fn pick_or_connect_stream(
         let stream = proxy_connector
             .connect(target_host, target_port, connect_timeout)
             .await?;
+
+        // For HTTPS requests, the proxy tunnel is a bare TCP transport — we still
+        // need to perform the TLS handshake with the target server before HTTP traffic.
+        let stream = if req.url.scheme() == "https" {
+            wrap_target_tls(client, req, stream).await?
+        } else {
+            stream
+        };
         return Ok((stream, false));
     }
 
@@ -501,6 +509,34 @@ async fn connect_fresh_tls(
     };
     let tls_stream = tls_connector.connect(host, tcp_stream).await
         .map_err(|e| ZjhttpcError::Tls(format!("TLS handshake failed: {e}")))?;
+    Ok(Box::new(tls_stream))
+}
+
+/// Wrap a proxy-tunneled stream with a TLS handshake to the actual target host.
+/// Used after CONNECT establishes a bare TCP tunnel through an HTTP(S) proxy.
+async fn wrap_target_tls(
+    client: &ZJHttpClient,
+    req: &Request,
+    stream: BoxedStream,
+) -> Result<BoxedStream> {
+    let tls_config = if req.trust_store_pem.is_some() {
+        Arc::new(create_tls_config(&req.trust_store_pem)?)
+    } else {
+        client.tls_config()?
+    };
+    let tls_connector: TlsConnector = tls_config.into();
+    let host = match req.url.host() {
+        Some(url::Host::Domain(s)) => s,
+        _ => {
+            return Err(ZjhttpcError::Tls(
+                "HTTPS request should specify the Domain instead of IP, or you can provide the sni domain name".to_string(),
+            ));
+        }
+    };
+    let tls_stream = tls_connector
+        .connect(host, stream)
+        .await
+        .map_err(|e| ZjhttpcError::Tls(format!("TLS handshake to target via proxy failed: {e}")))?;
     Ok(Box::new(tls_stream))
 }
 
