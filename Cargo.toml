@@ -6,7 +6,6 @@ description = "HTTP client made by Jinhui ZHANG. Aims at easy to use, with speci
 license = "GPL-3.0-only"
 
 [dependencies]
-anyhow_ext = "0.2.1"
 async-std = { version = "1.13.0", features = ["attributes"] }
 async-tls = "0.13.0"
 base64-simd = "0.8.0"
