@@ -767,6 +767,23 @@ impl Response {
         }
     }
 
+    /// Returns a streaming Server-Sent Events parser over the response body.
+    ///
+    /// Internally calls [`body_managed_stream`](Self::body_managed_stream) and
+    /// wraps it in a [`crate::sse::SseStream`], so chunked decoding, framing,
+    /// EOF detection, and connection-pool return are handled exactly as for a
+    /// normal streaming body. This method only adds SSE line buffering and
+    /// field parsing.
+    ///
+    /// Returns `None` if the body has already been read via `body_string()`,
+    /// `body_bytes()`, `body_managed_stream()`, etc.
+    ///
+    /// The caller should verify `Content-Type: text/event-stream` before using
+    /// this method — pointing it at a non-SSE response yields garbled events.
+    pub fn body_sse_stream(&mut self) -> Option<crate::sse::SseStream> {
+        self.body_managed_stream().map(crate::sse::SseStream::new)
+    }
+
     /// Read the entire body and return it as bytes
     ///
     /// This method consumes the response body and reads all data into memory.

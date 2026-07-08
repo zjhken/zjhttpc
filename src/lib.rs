@@ -10,6 +10,7 @@ pub mod misc;
 pub mod proxy;
 pub mod requestx;
 pub mod response;
+pub mod sse;
 pub mod stream;
 
 pub use url;
