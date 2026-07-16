@@ -723,7 +723,17 @@ impl Response {
 
         if let Some(stream) = self.body_raw_stream.take() {
             let prefix = &self.body_prefix[..self.body_prefix_len];
-            let pool = self.pool.clone();
+            // Only return the stream to the pool when the connection is reusable
+            // (server advertised keep-alive) AND the body has a deterministic end
+            // (chunked encoding or Content-Length). A body of unknown length only
+            // terminates on EOF, which means the peer has already closed the socket
+            // — handing that stream back would give the next request a dead
+            // connection (Broken pipe / EOF on retry).
+            let pool = if self.keep_alive && (is_chunked || content_length.is_some()) {
+                self.pool.clone()
+            } else {
+                None
+            };
             if is_chunked {
                 let chain =
                     crate::stream::ChainRead::new(crate::stream::SliceRead::new(prefix), stream);
