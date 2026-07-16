@@ -3,7 +3,7 @@ name = "zjhttpc"
 version = "0.10.0"
 edition = "2024"
 description = "HTTP client made by Jinhui ZHANG. Aims at easy to use, with special features I want"
-license = "GPL-3.0-only"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 async-std = { version = "1.13.0", features = ["attributes"] }
