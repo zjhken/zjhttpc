@@ -11,6 +11,7 @@ use derive_builder::Builder;
 use nom::{
     IResult, Parser,
     bytes::complete::{is_not, tag, take_till},
+    sequence::terminated,
 };
 
 use rustls_native_certs::load_native_certs;
@@ -1034,7 +1035,7 @@ fn parse_resp_first_line(input: &str) -> IResult<&str, (&str, &str, &str, &str, 
         take_till(|x| x == ' '),
         tag(" "),
         take_till(|x| x == ' ' || x == '\r'), // status message is not mandortory
-        take_till(|x| x == '\n'),
+        terminated(take_till(|x| x == '\n'), tag("\n")),
     )
         .parse(input)
 }
@@ -1234,6 +1235,39 @@ mod tests {
         assert_eq!(value, "text/html");
         assert_eq!(crlf, "\r\n");
         assert_eq!(remaining, "");
+    }
+
+    #[test]
+    fn test_parse_resp_first_line_does_not_leak_newline_into_headers() {
+        let input = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nServer: nginx\r\n\r\n";
+        let (remaining, (_, _, _, status_code, _)) = parse_resp_first_line(input).unwrap();
+        assert_eq!(status_code, "200");
+        assert!(
+            !remaining.starts_with('\n'),
+            "remaining must not start with '\\n', got: {remaining:?}"
+        );
+
+        let headers = parse_headers(remaining).unwrap();
+        assert_eq!(headers[0].0, "Content-Type");
+        assert_eq!(headers[0].1, "application/json");
+        assert_eq!(headers[1].0, "Server");
+        assert_eq!(headers[1].1, "nginx");
+    }
+
+    #[test]
+    fn test_parse_resp_first_line_without_reason_phrase() {
+        let input = "HTTP/1.1 204\r\nContent-Length: 0\r\n\r\n";
+        let (remaining, (_, version, _, status_code, _)) = parse_resp_first_line(input).unwrap();
+        assert_eq!(version, "1.1");
+        assert_eq!(status_code, "204");
+        assert!(
+            !remaining.starts_with('\n'),
+            "remaining must not start with '\\n', got: {remaining:?}"
+        );
+
+        let headers = parse_headers(remaining).unwrap();
+        assert_eq!(headers[0].0, "Content-Length");
+        assert_eq!(headers[0].1, "0");
     }
 
     #[test]

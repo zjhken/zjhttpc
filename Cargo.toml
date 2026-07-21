@@ -1,6 +1,6 @@
 [package]
 name = "zjhttpc"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2024"
 description = "HTTP client made by Jinhui ZHANG. Aims at easy to use, with special features I want"
 license = "AGPL-3.0-or-later"
