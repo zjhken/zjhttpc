@@ -1,4 +1,4 @@
-use crate::error::{Result, ZjhttpcError};
+use crate::error::{MultipartContentLengthSnafu, Result};
 use async_std::fs::File;
 use std::fmt;
 use std::path::PathBuf;
@@ -439,9 +439,9 @@ impl BodyMultipartForm {
                     total += format!("Content-Type: {}\r\n\r\n", content_type).len() as u64;
 
                     let meta = async_std::fs::metadata(path).await
-                        .map_err(|e| ZjhttpcError::MultipartContentLength(
-                            format!("cannot read metadata for {:?}: {e}", path)
-                        ))?;
+                        .map_err(|e| MultipartContentLengthSnafu {
+                            message: format!("cannot read metadata for {:?}: {e}", path)
+                        }.build())?;
                     total += meta.len();
                     total += 2; // \r\n
                 }
@@ -460,16 +460,16 @@ impl BodyMultipartForm {
                     total += format!("Content-Type: {}\r\n\r\n", content_type).len() as u64;
 
                     let meta = file.metadata().await
-                        .map_err(|e| ZjhttpcError::MultipartContentLength(
-                            format!("cannot read file metadata: {e}")
-                        ))?;
+                        .map_err(|e| MultipartContentLengthSnafu {
+                            message: format!("cannot read file metadata: {e}")
+                        }.build())?;
                     total += meta.len();
                     total += 2; // \r\n
                 }
                 MultipartField::Stream(..) => {
-                    return Err(ZjhttpcError::MultipartContentLength(
-                        "cannot compute content-length for Stream fields; use chunked encoding".into()
-                    ));
+                    return Err(MultipartContentLengthSnafu {
+                        message: "cannot compute content-length for Stream fields; use chunked encoding".to_string()
+                    }.build());
                 }
             }
         }

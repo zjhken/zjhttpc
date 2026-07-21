@@ -10,10 +10,11 @@ use url::Url;
 use crate::{
     body::{Body, BodyForm, BodyMultipartForm},
     cookie::Cookie,
-    error::{Result, ZjhttpcError},
+    error::{NoHostSnafu, Result},
     misc::TrustStorePem,
     proxy::HttpsProxyOption,
 };
+use snafu::OptionExt;
 
 pub struct Request {
     pub method: &'static str,
@@ -39,10 +40,13 @@ impl Request {
     #[must_use]
     pub fn new(method: &'static str, url: impl AsRef<str>) -> Result<Self> {
         let url: Url = url.as_ref().parse()?;
-        let host = url.host_str().ok_or(ZjhttpcError::NoHost)?;
+        let host = url.host_str().with_context(|| NoHostSnafu)?;
         let mut headers = HashMap::new();
         headers.insert("host".to_owned(), IndexSet::from([host.to_owned()]));
-        headers.insert("user-agent".to_owned(), IndexSet::from([format!("zjhttpc/{LIB_VERSION} (powered by Jinhui)")]));
+        headers.insert(
+            "user-agent".to_owned(),
+            IndexSet::from([format!("zjhttpc/{LIB_VERSION} (powered by Jinhui)")]),
+        );
         Ok(Request {
             method,
             url,
@@ -71,15 +75,19 @@ impl Request {
         if let Some(v) = self.headers.get_mut(key.as_ref()) {
             v.insert(value.as_ref().to_owned());
         } else {
-            self.headers
-                .insert(key.as_ref().to_owned(), IndexSet::from([value.as_ref().to_owned()]));
+            self.headers.insert(
+                key.as_ref().to_owned(),
+                IndexSet::from([value.as_ref().to_owned()]),
+            );
         }
         self
     }
 
     pub fn set_header(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        self.headers
-            .insert(key.as_ref().to_owned(), IndexSet::from([value.as_ref().to_owned()]));
+        self.headers.insert(
+            key.as_ref().to_owned(),
+            IndexSet::from([value.as_ref().to_owned()]),
+        );
         self
     }
 
@@ -92,11 +100,8 @@ impl Request {
         mut self,
         headers: std::collections::HashMap<String, String>,
     ) -> Self {
-        self.headers.extend(
-            headers
-                .into_iter()
-                .map(|(k, v)| (k, IndexSet::from([v]))),
-        );
+        self.headers
+            .extend(headers.into_iter().map(|(k, v)| (k, IndexSet::from([v]))));
         self
     }
 
@@ -123,8 +128,10 @@ impl Request {
     /// ```
     pub fn set_cookie(mut self, cookies: &[Cookie]) -> Self {
         let cookie_header = Cookie::format_for_request_cookie_header(cookies);
-        self.headers
-            .insert(crate::header::COOKIE.to_owned(), IndexSet::from([cookie_header]));
+        self.headers.insert(
+            crate::header::COOKIE.to_owned(),
+            IndexSet::from([cookie_header]),
+        );
         self
     }
 
@@ -271,9 +278,10 @@ impl Request {
     pub fn set_body_multipart_form(mut self, form: BodyMultipartForm) -> Self {
         // Auto-set Content-Type to multipart/form-data with boundary
         let boundary = form.boundary().to_string();
-        self.content_type = Some(Cow::Owned(
-            format!("multipart/form-data; boundary={}", boundary)
-        ));
+        self.content_type = Some(Cow::Owned(format!(
+            "multipart/form-data; boundary={}",
+            boundary
+        )));
 
         self.use_chunked = form.has_stream_field();
         self.content_length = 0; // placeholder; computed at send time for non-chunked
@@ -373,29 +381,38 @@ mod tests {
         let proxy = crate::proxy::HttpsProxyOption::new("http://proxy.example.com:8080").unwrap();
         request = request.set_proxy(proxy.clone());
         assert!(request.proxy.is_some());
-        assert_eq!(request.proxy.unwrap().url.host_str().unwrap(), "proxy.example.com");
+        assert_eq!(
+            request.proxy.unwrap().url.host_str().unwrap(),
+            "proxy.example.com"
+        );
     }
 
     #[test]
     fn test_request_proxy_from_url() {
-        let result = Request::new("GET", "http://example.com").unwrap()
+        let result = Request::new("GET", "http://example.com")
+            .unwrap()
             .set_proxy_from_url("http://proxy.example.com:8080");
         assert!(result.is_ok());
         let request = result.unwrap();
         assert!(request.proxy.is_some());
-        assert_eq!(request.proxy.unwrap().url.host_str().unwrap(), "proxy.example.com");
+        assert_eq!(
+            request.proxy.unwrap().url.host_str().unwrap(),
+            "proxy.example.com"
+        );
     }
 
     #[test]
     fn test_request_invalid_proxy_url() {
-        let result = Request::new("GET", "http://example.com").unwrap()
+        let result = Request::new("GET", "http://example.com")
+            .unwrap()
             .set_proxy_from_url("invalid-url");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_request_connect_timeout() {
-        let request = Request::new("GET", "http://example.com").unwrap()
+        let request = Request::new("GET", "http://example.com")
+            .unwrap()
             .set_connect_timeout(Duration::from_secs(5));
         assert_eq!(request.connect_timeout, Some(Duration::from_secs(5)));
     }
@@ -412,7 +429,7 @@ mod tests {
             .unwrap()
             .add_query("param1", "value1")
             .add_query("param2", "value2");
-        
+
         assert_eq!(request.url.query(), Some("param1=value1&param2=value2"));
     }
 
@@ -421,7 +438,7 @@ mod tests {
         let request = Request::new("GET", "http://example.com?existing=test")
             .unwrap()
             .add_query("param1", "value1");
-        
+
         assert_eq!(request.url.query(), Some("existing=test&param1=value1"));
     }
 
@@ -431,7 +448,7 @@ mod tests {
             .unwrap()
             .add_query("query", "hello world")
             .add_query("symbol", "@#$%");
-        
+
         let query = request.url.query().unwrap();
         assert!(query.contains("query=hello+world"));
         assert!(query.contains("symbol=%40%23%24%25"));
@@ -443,7 +460,7 @@ mod tests {
             .unwrap()
             .add_query("empty", "")
             .add_query("param", "value");
-        
+
         assert_eq!(request.url.query(), Some("empty=&param=value"));
     }
 
@@ -453,7 +470,7 @@ mod tests {
             .unwrap()
             .add_query("key", "value1")
             .add_query("key", "value2");
-        
+
         let query = request.url.query().unwrap();
         assert!(query.contains("key=value1"));
         assert!(query.contains("key=value2"));
@@ -466,7 +483,7 @@ mod tests {
             .unwrap()
             .add_query("api_key", "secret123")
             .add_query("format", "json");
-        
+
         assert_eq!(request.url.query(), Some("api_key=secret123&format=json"));
         assert_eq!(request.url.scheme(), "https");
         assert_eq!(request.url.path(), "/endpoint");
@@ -477,7 +494,7 @@ mod tests {
         let request = Request::new("GET", "http://example.com/path/to/resource#section")
             .unwrap()
             .add_query("filter", "all");
-        
+
         assert_eq!(request.url.query(), Some("filter=all"));
         assert_eq!(request.url.path(), "/path/to/resource");
         assert_eq!(request.url.fragment(), Some("section"));
@@ -489,7 +506,7 @@ mod tests {
             .unwrap()
             .add_query("emoji", "🚀")
             .add_query("chinese", "你好");
-        
+
         let query = request.url.query().unwrap();
         assert!(query.contains("emoji=%F0%9F%9A%80"));
         assert!(query.contains("chinese=%E4%BD%A0%E5%A5%BD"));
@@ -506,7 +523,10 @@ mod tests {
 
         assert_eq!(request.url.query(), Some("a=1&b=2&c=3"));
         assert!(request.headers.contains_key("Accept"));
-        assert_eq!(request.headers.get("Accept").unwrap().first().unwrap(), "application/json");
+        assert_eq!(
+            request.headers.get("Accept").unwrap().first().unwrap(),
+            "application/json"
+        );
     }
 
     #[test]

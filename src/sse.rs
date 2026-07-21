@@ -506,7 +506,7 @@ mod tests {
         let mut s = SseStream::new(Box::new(ErroringStream));
         let err = s.next_event().await.unwrap_err();
         match err {
-            ZjhttpcError::Io(arc) => assert!(arc.to_string().contains("boom")),
+            ZjhttpcError::Io { source: arc, .. } => assert!(arc.to_string().contains("boom")),
             other => panic!("expected Io error, got {other:?}"),
         }
     }

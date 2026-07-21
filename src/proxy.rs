@@ -13,7 +13,11 @@ use rustls_pemfile;
 use tracing::{debug, error};
 use url::Url;
 
-use crate::error::{Result, ZjhttpcError};
+use crate::error::{
+    CertificateSnafu, ConnectionSnafu, ConnectionTimeoutSnafu, DnsSnafu, InvalidUrlSnafu,
+    NoPortSnafu, ProxySnafu, Result, TlsSnafu,
+};
+use snafu::prelude::*;
 use crate::misc::TrustStorePem;
 use crate::stream::BoxedStream;
 
@@ -35,18 +39,18 @@ impl HttpsProxyOption {
         let url: Url = proxy_url
             .as_ref()
             .parse()
-            .map_err(|e| ZjhttpcError::InvalidUrl(e))?;
+            .context(InvalidUrlSnafu)?;
 
         if url.scheme() != "http" && url.scheme() != "https" {
-            return Err(ZjhttpcError::Proxy("proxy URL must use http or https scheme".to_string()));
+            return Err(ProxySnafu { message: "proxy URL must use http or https scheme".to_string() }.build());
         }
 
         let host = url
             .host_str()
-            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string()))?;
+            .ok_or_else(|| ProxySnafu { message: "proxy URL must have a host".to_string() }.build())?;
         let port = url
             .port_or_known_default()
-            .ok_or(ZjhttpcError::NoPort)?;
+            .ok_or_else(|| NoPortSnafu.build())?;
 
         let addrs = format!("{}:{}", host, port)
             .parse::<SocketAddr>()
@@ -56,9 +60,9 @@ impl HttpsProxyOption {
                     Ok(SocketAddr::from(([127, 0, 0, 1], port)))
                 } else {
                     std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-                        .map_err(|e| ZjhttpcError::Dns(format!("failed to resolve proxy address: {e}")))?
+                        .map_err(|e| DnsSnafu { message: format!("failed to resolve proxy address: {e}") }.build())?
                         .next()
-                        .ok_or(ZjhttpcError::Dns("no proxy addresses found".to_string()))
+                        .ok_or_else(|| DnsSnafu { message: "no proxy addresses found".to_string() }.build())
                 }
             })?;
 
@@ -81,10 +85,10 @@ impl HttpsProxyOption {
     pub fn from_url(url: Url) -> Result<Self> {
         let host = url
             .host_str()
-            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string()))?;
+            .ok_or_else(|| ProxySnafu { message: "proxy URL must have a host".to_string() }.build())?;
         let port = url
             .port_or_known_default()
-            .ok_or(ZjhttpcError::NoPort)?;
+            .ok_or_else(|| NoPortSnafu.build())?;
 
         let addrs = format!("{}:{}", host, port)
             .parse::<SocketAddr>()
@@ -93,9 +97,9 @@ impl HttpsProxyOption {
                     Ok(SocketAddr::from(([127, 0, 0, 1], port)))
                 } else {
                     std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-                        .map_err(|e| ZjhttpcError::Dns(format!("failed to resolve proxy address: {e}")))?
+                        .map_err(|e| DnsSnafu { message: format!("failed to resolve proxy address: {e}") }.build())?
                         .next()
-                        .ok_or(ZjhttpcError::Dns("no proxy addresses found".to_string()))
+                        .ok_or_else(|| DnsSnafu { message: "no proxy addresses found".to_string() }.build())
                 }
             })?;
 
@@ -164,8 +168,8 @@ impl ProxyConnector {
         // Create TCP stream with connect timeout
         let mut tcp_stream = match async_std::future::timeout(connect_timeout, TcpStream::connect(&proxy_addr)).await {
             Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(ZjhttpcError::Connection(format!("HTTP proxy connection failed: {e}"))),
-            Err(_) => return Err(ZjhttpcError::ConnectionTimeout(connect_timeout)),
+            Ok(Err(e)) => return Err(ConnectionSnafu { message: format!("HTTP proxy connection failed: {e}") }.build()),
+            Err(_) => return Err(ConnectionTimeoutSnafu { duration: connect_timeout }.build()),
         };
 
         let connect_request = format!(
@@ -187,11 +191,11 @@ impl ProxyConnector {
         tcp_stream
             .write_all(connect_request.as_bytes())
             .await
-            .map_err(|e| ZjhttpcError::Proxy(format!("failed to send CONNECT request to proxy: {e}")))?;
+            .map_err(|e| ProxySnafu { message: format!("failed to send CONNECT request to proxy: {e}") }.build())?;
         tcp_stream
             .flush()
             .await
-            .map_err(|e| ZjhttpcError::Proxy(format!("failed to flush proxy connection: {e}")))?;
+            .map_err(|e| ProxySnafu { message: format!("failed to flush proxy connection: {e}") }.build())?;
 
         read_connect_response(&mut tcp_stream).await?;
 
@@ -214,20 +218,20 @@ impl ProxyConnector {
         // Create TCP stream with connect timeout
         let tcp_stream = match async_std::future::timeout(connect_timeout, TcpStream::connect(&proxy_addr)).await {
             Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(ZjhttpcError::Connection(format!("HTTPS proxy connection failed: {e}"))),
-            Err(_) => return Err(ZjhttpcError::ConnectionTimeout(connect_timeout)),
+            Ok(Err(e)) => return Err(ConnectionSnafu { message: format!("HTTPS proxy connection failed: {e}") }.build()),
+            Err(_) => return Err(ConnectionTimeoutSnafu { duration: connect_timeout }.build()),
         };
 
         let proxy_host = self
             .proxy
             .url
             .host_str()
-            .ok_or(ZjhttpcError::Proxy("proxy URL must have a host".to_string()))?;
+            .ok_or_else(|| ProxySnafu { message: "proxy URL must have a host".to_string() }.build())?;
 
         let tls_stream = tls_connector
             .connect(proxy_host, tcp_stream)
             .await
-            .map_err(|e| ZjhttpcError::Tls(format!("failed to establish TLS connection to HTTPS proxy: {e}")))?;
+            .map_err(|e| TlsSnafu { message: format!("failed to establish TLS connection to HTTPS proxy: {e}") }.build())?;
 
         let connect_request = format!(
             "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Connection: Keep-Alive\r\n",
@@ -249,11 +253,11 @@ impl ProxyConnector {
         stream
             .write_all(connect_request.as_bytes())
             .await
-            .map_err(|e| ZjhttpcError::Proxy(format!("failed to send CONNECT request to HTTPS proxy: {e}")))?;
+            .map_err(|e| ProxySnafu { message: format!("failed to send CONNECT request to HTTPS proxy: {e}") }.build())?;
         stream
             .flush()
             .await
-            .map_err(|e| ZjhttpcError::Proxy(format!("failed to flush proxy connection: {e}")))?;
+            .map_err(|e| ProxySnafu { message: format!("failed to flush proxy connection: {e}") }.build())?;
 
         read_connect_response(&mut stream).await?;
 
@@ -278,16 +282,16 @@ where
         let n = stream
             .read(&mut buf[filled..])
             .await
-            .map_err(|e| ZjhttpcError::Proxy(format!("failed to read proxy CONNECT response: {e}")))?;
+            .map_err(|e| ProxySnafu { message: format!("failed to read proxy CONNECT response: {e}") }.build())?;
         if n == 0 {
-            return Err(ZjhttpcError::Proxy("proxy closed connection before responding".to_string()));
+            return Err(ProxySnafu { message: "proxy closed connection before responding".to_string() }.build());
         }
         filled += n;
 
         if filled >= 4 && buf[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
             if !buf.starts_with(b"HTTP/1.1 200") && !buf.starts_with(b"HTTP/1.0 200") {
                 let text = String::from_utf8_lossy(&buf[..filled]);
-                return Err(ZjhttpcError::Proxy(format!("proxy CONNECT failed: {}", text.trim())));
+                return Err(ProxySnafu { message: format!("proxy CONNECT failed: {}", text.trim()) }.build());
             }
             return Ok(());
         }
@@ -298,16 +302,14 @@ fn create_proxy_tls_config() -> Result<ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     let cert_result = load_native_certs();
     if !cert_result.errors.is_empty() && cert_result.certs.is_empty() {
-        return Err(ZjhttpcError::Certificate(format!(
-            "failed to load system certs: {:?}", cert_result.errors
-        )));
+        return Err(CertificateSnafu { message: format!("failed to load system certs: {:?}", cert_result.errors) }.build());
     }
     let certs = cert_result.certs;
 
     for cert in certs {
         root_store
             .add(&Certificate(cert.to_vec()))
-            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}")))?;
+            .map_err(|e| CertificateSnafu { message: format!("failed to add certificate: {e}") }.build())?;
     }
 
     let client_config = ClientConfig::builder()
@@ -326,9 +328,7 @@ fn create_proxy_tls_config_with_trust_store(
         None => {
             let cert_result = load_native_certs();
             if !cert_result.errors.is_empty() && cert_result.certs.is_empty() {
-                return Err(ZjhttpcError::Certificate(format!(
-                    "failed to load system certs: {:?}", cert_result.errors
-                )));
+                return Err(CertificateSnafu { message: format!("failed to load system certs: {:?}", cert_result.errors) }.build());
             }
             cert_result.certs
         }
@@ -346,7 +346,7 @@ fn create_proxy_tls_config_with_trust_store(
         }
         Some(TrustStorePem::Path(p)) => {
             let file = std::fs::File::open(p)
-                .map_err(|e| ZjhttpcError::Certificate(format!("failed to open trust store file: {e}")))?;
+                .map_err(|e| CertificateSnafu { message: format!("failed to open trust store file: {e}") }.build())?;
             let mut reader = std::io::BufReader::new(file);
             rustls_pemfile::certs(&mut reader)
                 .filter_map(|re| match re {
@@ -363,7 +363,7 @@ fn create_proxy_tls_config_with_trust_store(
     for cert in certs {
         root_store
             .add(&Certificate(cert.to_vec()))
-            .map_err(|e| ZjhttpcError::Certificate(format!("failed to add certificate: {e}")))?;
+            .map_err(|e| CertificateSnafu { message: format!("failed to add certificate: {e}") }.build())?;
     }
 
     let client_config = ClientConfig::builder()

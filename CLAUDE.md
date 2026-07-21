@@ -57,7 +57,7 @@ Pool config is set via `ZJHttpClient::set_pool_config(max_per_key, max_total, id
 
 ### Error Handling
 
-Mixed approach: `ZjhttpcError` (`error.rs`) uses `thiserror` for typed HTTP parsing errors, while the client code uses `anyhow_ext` for contextual error chains with `.dot()` extension.
+`ZjhttpcError` (`error.rs`) is a typed enum derived with `snafu`. Every variant carries an implicit `snafu::Location` field that auto-captures `file:line:col` at the construction site, so any error printed via `{}` / `to_string()` shows where it was raised (e.g. `"DNS resolution failed: ... at src/client.rs:555:22"`). Construct errors via `XSnafu { ... }.build()` or `.context(XSnafu)?`; for `Option`, use `snafu::OptionExt::context`. The `From<io::Error>` / `From<url::ParseError>` / `From<serde_qs::Error>` impls are `#[track_caller]` so bare `?` on those types also captures location.
 
 ### Re-exports
 
@@ -71,7 +71,7 @@ Mixed approach: `ZjhttpcError` (`error.rs`) uses `thiserror` for typed HTTP pars
 - `nom` — HTTP response header parsing
 - `derive_builder` — client struct builder
 - `encoding_rs` — charset support including GBK
-- `snafu` — used alongside anyhow/thiserror in some modules
+- `snafu` — typed errors with implicit caller-`Location` capture (replaces thiserror/anyhow_ext)
 
 ## Notes
 

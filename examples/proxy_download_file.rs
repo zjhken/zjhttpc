@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use async_std::{fs::File, io::ReadExt, io::WriteExt, path::Path};
 
-use zjhttpc::{Result, client::ZJHttpClient, error::ZjhttpcError, requestx::Request};
+use zjhttpc::{Result, client::ZJHttpClient, error::InvalidResponseSnafu, requestx::Request};
 
 const URL: &str = "https://raw.githubusercontent.com/metowolf/iplist/master/data/country/CN.txt";
 const PROXY: &str = "http://10.0.0.2:1080";
@@ -42,12 +42,13 @@ fn main() -> Result<()> {
 
         if !response.is_success() {
             let body = response.body_string().await.unwrap_or_default();
-            return Err(ZjhttpcError::InvalidResponse(format!(
-                "download failed with status {}: {}",
-                response.status_code(),
-                body.chars().take(500).collect::<String>()
-            ))
-            .into());
+            return Err(InvalidResponseSnafu {
+                message: format!(
+                    "download failed with status {}: {}",
+                    response.status_code(),
+                    body.chars().take(500).collect::<String>()
+                ),
+            }.build().into());
         }
 
         let output_path = Path::new(OUTPUT);

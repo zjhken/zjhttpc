@@ -1,99 +1,285 @@
 use std::sync::Arc;
 use std::time::Duration;
-use thiserror::Error;
+use snafu::Snafu;
 
 /// Error type for zjhttpc operations.
 ///
 /// All public API functions return `Result<T, ZjhttpcError>`.
 /// Callers can match on specific variants to handle different error categories.
-#[derive(Debug, Clone, Error)]
+///
+/// Each variant carries an implicit [`snafu::Location`] captured automatically
+/// at the construction site (via the `*Snafu` selector or through a `#[track_caller]`
+/// `From` impl), so callers can locate the source line via `ErrorCompat` or by
+/// formatting the location.
+#[derive(Debug, Clone, Snafu)]
+#[snafu(visibility(pub))]
 #[non_exhaustive]
 pub enum ZjhttpcError {
     // URL / Request validation
-    #[error("URL parse error: {0}")]
-    InvalidUrl(#[from] url::ParseError),
+    #[snafu(display("URL parse error: {source} at {location}"))]
+    InvalidUrl {
+        #[snafu(source)]
+        source: url::ParseError,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("no host in URL")]
-    NoHost,
+    #[snafu(display("no host in URL at {location}"))]
+    NoHost {
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("URL must have a valid port")]
-    NoPort,
+    #[snafu(display("URL must have a valid port at {location}"))]
+    NoPort {
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("unsupported scheme: {0}")]
-    UnsupportedScheme(String),
+    #[snafu(display("unsupported scheme: {scheme} at {location}"))]
+    UnsupportedScheme {
+        scheme: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
     // DNS
-    #[error("DNS resolution failed: {0}")]
-    Dns(String),
+    #[snafu(display("DNS resolution failed: {message} at {location}"))]
+    Dns {
+        message: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
     // Connection
-    #[error("connection failed: {0}")]
-    Connection(String),
+    #[snafu(display("connection failed: {message} at {location}"))]
+    Connection {
+        message: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("connection timeout after {0:?}")]
-    ConnectionTimeout(Duration),
+    #[snafu(display("connection timeout after {duration:?} at {location}"))]
+    ConnectionTimeout {
+        duration: Duration,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
     // TLS / Certificate
-    #[error("TLS error: {0}")]
-    Tls(String),
+    #[snafu(display("TLS error: {message} at {location}"))]
+    Tls {
+        message: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("certificate error: {0}")]
-    Certificate(String),
+    #[snafu(display("certificate error: {message} at {location}"))]
+    Certificate {
+        message: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
     // Proxy
-    #[error("proxy error: {0}")]
-    Proxy(String),
+    #[snafu(display("proxy error: {message} at {location}"))]
+    Proxy {
+        message: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
     // Timeout
-    #[error("send header timeout after {0:?}")]
-    SendHeaderTimeout(Duration),
+    #[snafu(display("send header timeout after {duration:?} at {location}"))]
+    SendHeaderTimeout {
+        duration: Duration,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("read header timeout after {0:?}")]
-    ReadHeaderTimeout(Duration),
+    #[snafu(display("read header timeout after {duration:?} at {location}"))]
+    ReadHeaderTimeout {
+        duration: Duration,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("read body timeout after {0:?}")]
-    ReadBodyTimeout(Duration),
+    #[snafu(display("read body timeout after {duration:?} at {location}"))]
+    ReadBodyTimeout {
+        duration: Duration,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
     // Response parsing
-    #[error("invalid HTTP response: {0}")]
-    InvalidResponse(String),
+    #[snafu(display("invalid HTTP response: {message} at {location}"))]
+    InvalidResponse {
+        message: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("response headers exceeded limit ({actual} > {max})")]
-    ResponseTooLarge { actual: usize, max: usize },
+    #[snafu(display("response headers exceeded limit ({actual} > {max}) at {location}"))]
+    ResponseTooLarge {
+        actual: usize,
+        max: usize,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("unexpected EOF: {0}")]
-    UnexpectedEof(String),
+    #[snafu(display("unexpected EOF: {message} at {location}"))]
+    UnexpectedEof {
+        message: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
     // Body
-    #[error("response body has already been read")]
-    BodyAlreadyRead,
+    #[snafu(display("response body has already been read at {location}"))]
+    BodyAlreadyRead {
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("JSON parsing failed: {message}")]
-    JsonParsing { message: String, preview: String },
+    #[snafu(display("JSON parsing failed: {message} at {location}"))]
+    JsonParsing {
+        message: String,
+        preview: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    // Query serialization
-    #[error("query serialization error: {0}")]
-    QuerySerialize(String),
+    // Query serialization (serde_qs::Error is not Clone, so we keep its display string)
+    #[snafu(display("query serialization error: {message} at {location}"))]
+    QuerySerialize {
+        message: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
     // Multipart
-    #[error("multipart content-length computation failed: {0}")]
-    MultipartContentLength(String),
+    #[snafu(display("multipart content-length computation failed: {message} at {location}"))]
+    MultipartContentLength {
+        message: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
     // IO
-    #[error("{0}")]
-    Io(Arc<std::io::Error>),
+    #[snafu(display("{source} at {location}"))]
+    Io {
+        #[snafu(source(from(std::io::Error, Arc::new)))]
+        source: Arc<std::io::Error>,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+}
+
+impl ZjhttpcError {
+    /// Returns the source code location where this error was constructed, if available.
+    pub fn location(&self) -> Option<&snafu::Location> {
+        Some(match self {
+            ZjhttpcError::InvalidUrl { location, .. }
+            | ZjhttpcError::NoHost { location }
+            | ZjhttpcError::NoPort { location }
+            | ZjhttpcError::UnsupportedScheme { location, .. }
+            | ZjhttpcError::Dns { location, .. }
+            | ZjhttpcError::Connection { location, .. }
+            | ZjhttpcError::ConnectionTimeout { location, .. }
+            | ZjhttpcError::Tls { location, .. }
+            | ZjhttpcError::Certificate { location, .. }
+            | ZjhttpcError::Proxy { location, .. }
+            | ZjhttpcError::SendHeaderTimeout { location, .. }
+            | ZjhttpcError::ReadHeaderTimeout { location, .. }
+            | ZjhttpcError::ReadBodyTimeout { location, .. }
+            | ZjhttpcError::InvalidResponse { location, .. }
+            | ZjhttpcError::ResponseTooLarge { location, .. }
+            | ZjhttpcError::UnexpectedEof { location, .. }
+            | ZjhttpcError::BodyAlreadyRead { location }
+            | ZjhttpcError::JsonParsing { location, .. }
+            | ZjhttpcError::QuerySerialize { location, .. }
+            | ZjhttpcError::MultipartContentLength { location, .. }
+            | ZjhttpcError::Io { location, .. } => location,
+        })
+    }
+}
+
+#[track_caller]
+fn caller_location() -> snafu::Location {
+    snafu::Location::default()
 }
 
 impl From<std::io::Error> for ZjhttpcError {
+    #[track_caller]
     fn from(e: std::io::Error) -> Self {
-        ZjhttpcError::Io(Arc::new(e))
+        ZjhttpcError::Io {
+            source: Arc::new(e),
+            location: caller_location(),
+        }
     }
 }
 
 impl From<serde_qs::Error> for ZjhttpcError {
+    #[track_caller]
     fn from(e: serde_qs::Error) -> Self {
-        ZjhttpcError::QuerySerialize(e.to_string())
+        ZjhttpcError::QuerySerialize {
+            message: e.to_string(),
+            location: caller_location(),
+        }
+    }
+}
+
+impl From<url::ParseError> for ZjhttpcError {
+    #[track_caller]
+    fn from(e: url::ParseError) -> Self {
+        ZjhttpcError::InvalidUrl {
+            source: e,
+            location: caller_location(),
+        }
     }
 }
 
 pub type Result<T> = std::result::Result<T, ZjhttpcError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snafu_selector_captures_caller_location() {
+        let err = DnsSnafu { message: "test".to_string() }.build();
+        let loc = err.location().expect("location should be captured");
+        assert!(
+            loc.file.ends_with("error.rs"),
+            "expected file to end with error.rs, got {}",
+            loc.file,
+        );
+        assert!(loc.line > 0);
+        assert!(loc.column > 0);
+        let s = format!("{err}");
+        assert!(
+            s.contains("error.rs") && s.contains(':'),
+            "display should include location, got: {s}",
+        );
+    }
+
+    #[test]
+    fn from_io_error_captures_caller_location() {
+        fn fallible() -> Result<()> {
+            // intentional io error
+            let _ = std::fs::File::open("/nonexistent-zjhttpc-test-path-xyz")?;
+            Ok(())
+        }
+        let err = fallible().unwrap_err();
+        match err {
+            ZjhttpcError::Io { location, .. } => {
+                assert!(
+                    location.file.ends_with("error.rs"),
+                    "From<io::Error> should capture caller location via #[track_caller], got {}",
+                    location.file,
+                );
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+}

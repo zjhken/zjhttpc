@@ -8,7 +8,7 @@ use tracing::error;
 
 use crate::{
     client::ConnectionPool,
-    error::{Result, ZjhttpcError},
+    error::{BodyAlreadyReadSnafu, InvalidResponseSnafu, JsonParsingSnafu, ReadBodyTimeoutSnafu, Result, ZjhttpcError},
     misc::HttpVersion,
     proxy::HttpsProxyOption,
     stream::{BoxedStream, ChainRead, SliceRead},
@@ -547,13 +547,11 @@ impl Response {
             "1.1" => HttpVersion::V1_1,
             "1.0" => HttpVersion::V1_0,
             others => {
-                return Err(ZjhttpcError::InvalidResponse(format!(
-                    "unsupported HTTP version: {others}"
-                )));
+                return Err(InvalidResponseSnafu { message: format!("unsupported HTTP version: {others}") }.build());
             }
         };
         let status_code: u16 = status_code.parse().map_err(|_| {
-            ZjhttpcError::InvalidResponse(format!("invalid HTTP status code: {status_code}"))
+            InvalidResponseSnafu { message: format!("invalid HTTP status code: {status_code}") }.build()
         })?;
         let mut headers: HashMap<String, IndexSet<String>> = HashMap::new();
         for (key, value) in headers_vec {
@@ -647,7 +645,7 @@ impl Response {
 
     pub async fn body_string(&mut self) -> Result<String> {
         if self.is_body_read_complete() {
-            return Err(ZjhttpcError::BodyAlreadyRead);
+            return Err(BodyAlreadyReadSnafu.build());
         }
 
         if let Some(mut stream) = self.body_managed_stream() {
@@ -667,7 +665,7 @@ impl Response {
             if let Some(timeout) = self.read_body_timeout {
                 async_std::future::timeout(timeout, read_future)
                     .await
-                    .map_err(|_| ZjhttpcError::ReadBodyTimeout(timeout))
+                    .map_err(|_| ReadBodyTimeoutSnafu { duration: timeout }.build())
                     ??;
             } else {
                 read_future.await?;
@@ -800,7 +798,7 @@ impl Response {
     /// For large bodies, consider using body_managed_stream() for streaming access.
     pub async fn body_bytes(&mut self) -> Result<Vec<u8>> {
         if self.is_body_read_complete() {
-            return Err(ZjhttpcError::BodyAlreadyRead);
+            return Err(BodyAlreadyReadSnafu.build());
         }
 
         if let Some(mut stream) = self.body_managed_stream() {
@@ -820,7 +818,7 @@ impl Response {
             if let Some(timeout) = self.read_body_timeout {
                 async_std::future::timeout(timeout, read_future)
                     .await
-                    .map_err(|_| ZjhttpcError::ReadBodyTimeout(timeout))
+                    .map_err(|_| ReadBodyTimeoutSnafu { duration: timeout }.build())
                     ??;
             } else {
                 read_future.await?;
@@ -846,10 +844,10 @@ impl Response {
             } else {
                 preview.into_owned()
             };
-            ZjhttpcError::JsonParsing {
+            JsonParsingSnafu {
                 message: e.to_string(),
                 preview,
-            }
+            }.build()
         })
     }
 
