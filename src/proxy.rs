@@ -10,12 +10,12 @@ use async_tls::TlsConnector;
 use rustls::{Certificate, ClientConfig};
 use rustls_native_certs::load_native_certs;
 use rustls_pemfile;
-use tracing::{debug, error};
+use tracing::debug;
 use url::Url;
 
 use crate::error::{
 	CertificateSnafu, ConnectionSnafu, ConnectionTimeoutSnafu, DnsSnafu, InvalidUrlSnafu,
-	NoPortSnafu, ProxySnafu, Result, TlsSnafu,
+	NoPortSnafu, ParseCertSnafu, ProxySnafu, Result, TlsSnafu,
 };
 use crate::misc::TrustStorePem;
 use crate::stream::BoxedStream;
@@ -423,14 +423,8 @@ fn create_proxy_tls_config_with_trust_store(
 		Some(TrustStorePem::Bytes(data)) => {
 			let mut reader = std::io::BufReader::new(data.as_slice());
 			rustls_pemfile::certs(&mut reader)
-				.filter_map(|re| match re {
-					Ok(c) => Some(c),
-					Err(err) => {
-						error!(?err, "failed to parse cert");
-						None
-					}
-				})
-				.collect::<Vec<_>>()
+				.collect::<std::io::Result<Vec<_>>>()
+				.context(ParseCertSnafu)?
 		}
 		Some(TrustStorePem::Path(p)) => {
 			let file = std::fs::File::open(p).map_err(|e| {
@@ -441,14 +435,8 @@ fn create_proxy_tls_config_with_trust_store(
 			})?;
 			let mut reader = std::io::BufReader::new(file);
 			rustls_pemfile::certs(&mut reader)
-				.filter_map(|re| match re {
-					Ok(c) => Some(c),
-					Err(err) => {
-						error!(?err, "failed to parse cert");
-						None
-					}
-				})
-				.collect::<Vec<_>>()
+				.collect::<std::io::Result<Vec<_>>>()
+				.context(ParseCertSnafu)?
 		}
 	};
 

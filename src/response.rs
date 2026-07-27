@@ -4,13 +4,11 @@ use hashbrown::HashMap;
 use indexmap::IndexSet;
 use std::net::SocketAddr;
 
-use tracing::error;
-
 use crate::{
 	client::ConnectionPool,
 	error::{
-		BodyAlreadyReadSnafu, InvalidResponseSnafu, JsonParsingSnafu, ReadBodyTimeoutSnafu, Result,
-		ZjhttpcError,
+		BodyAlreadyReadSnafu, GbkDecodeSnafu, InvalidResponseSnafu, JsonParsingSnafu,
+		ReadBodyTimeoutSnafu, Result, ZjhttpcError,
 	},
 	misc::HttpVersion,
 	proxy::HttpsProxyOption,
@@ -663,7 +661,10 @@ impl Response {
 			{
 				let (cow, _encoding, had_errors) = GBK.decode(&bytes.as_slice());
 				if had_errors {
-					error!("GBK decode with errors");
+					return Err(GbkDecodeSnafu {
+						preview: cow.to_string(),
+					}
+					.build());
 				}
 				return Ok(cow.to_string());
 			} else {

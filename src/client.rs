@@ -27,8 +27,9 @@ use crate::{
 	body::Body,
 	error::{
 		CertificateSnafu, ConnectionSnafu, ConnectionTimeoutSnafu, DnsSnafu, InvalidResponseSnafu,
-		NoHostSnafu, NoPortSnafu, ReadHeaderTimeoutSnafu, ResponseTooLargeSnafu, Result,
-		SendHeaderTimeoutSnafu, TlsSnafu, UnexpectedEofSnafu, UnsupportedSchemeSnafu, ZjhttpcError,
+		NoHostSnafu, NoPortSnafu, ParseCertSnafu, ReadHeaderTimeoutSnafu, ResponseTooLargeSnafu,
+		Result, SendHeaderTimeoutSnafu, TlsSnafu, UnexpectedEofSnafu, UnsupportedSchemeSnafu,
+		ZjhttpcError,
 	},
 	misc::TrustStorePem,
 	proxy::{HttpsProxyOption, ProxyConnector},
@@ -36,9 +37,9 @@ use crate::{
 	response::Response,
 	stream::BoxedStream,
 };
-use snafu::OptionExt;
+use snafu::{OptionExt, ResultExt};
 
-use tracing::{error, info, trace};
+use tracing::trace;
 
 /// Connection type for pool key
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -492,10 +493,10 @@ async fn pick_or_connect_stream(
 			};
 
 			if let Some(stream_from_pool) = try_pick_from_pool(&client.connection_pool, &key) {
-				info!(?addr, "picking up direct TCP stream from pool");
+				trace!(?addr, "picking up direct TCP stream from pool");
 				return Ok((stream_from_pool, true));
 			}
-			info!(?addr, "no existing TCP connection for this addr");
+			trace!(?addr, "no existing TCP connection for this addr");
 			let stream = connect_fresh_tcp(client, req, addr).await?;
 			Ok((stream, false))
 		}
@@ -675,14 +676,8 @@ pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::
 		Some(TrustStorePem::Bytes(data)) => {
 			let mut reader = std::io::BufReader::new(data.as_slice());
 			rustls_pemfile::certs(&mut reader)
-				.filter_map(|re| match re {
-					Ok(c) => Some(c),
-					Err(err) => {
-						error!(?err, "failed to parse cert");
-						None
-					}
-				})
-				.collect::<Vec<_>>()
+				.collect::<std::io::Result<Vec<_>>>()
+				.context(ParseCertSnafu)?
 		}
 		Some(TrustStorePem::Path(p)) => {
 			let file = std::fs::File::open(p).map_err(|e| {
@@ -693,14 +688,8 @@ pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::
 			})?;
 			let mut reader = std::io::BufReader::new(file);
 			rustls_pemfile::certs(&mut reader)
-				.filter_map(|re| match re {
-					Ok(c) => Some(c),
-					Err(err) => {
-						error!(?err, "failed to parse cert");
-						None
-					}
-				})
-				.collect::<Vec<_>>()
+				.collect::<std::io::Result<Vec<_>>>()
+				.context(ParseCertSnafu)?
 		}
 	};
 	for cert in certs {

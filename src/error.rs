@@ -149,6 +149,21 @@ pub enum ZjhttpcError {
 		location: snafu::Location,
 	},
 
+	#[snafu(display("GBK string decode error. str={preview} at {location}"))]
+	GbkDecode {
+		preview: String,
+		#[snafu(implicit)]
+		location: snafu::Location,
+	},
+
+	#[snafu(display("parse cert error: {source} at {location}"))]
+	ParseCert {
+		#[snafu(source(from(std::io::Error, Arc::new)))]
+		source: Arc<std::io::Error>,
+		#[snafu(implicit)]
+		location: snafu::Location,
+	},
+
 	// Query serialization (serde_qs::Error is not Clone, so we keep its display string)
 	#[snafu(display("query serialization error: {message} at {location}"))]
 	QuerySerialize {
@@ -188,6 +203,8 @@ impl ZjhttpcError {
 			| ZjhttpcError::ConnectionTimeout { location, .. }
 			| ZjhttpcError::Tls { location, .. }
 			| ZjhttpcError::Certificate { location, .. }
+			| ZjhttpcError::GbkDecode { location, .. }
+			| ZjhttpcError::ParseCert { location, .. }
 			| ZjhttpcError::Proxy { location, .. }
 			| ZjhttpcError::SendHeaderTimeout { location, .. }
 			| ZjhttpcError::ReadHeaderTimeout { location, .. }
