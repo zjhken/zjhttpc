@@ -98,12 +98,12 @@ where
 					// one immediately rather than waiting for the timer
 					// (RFC 8305 §5: a failed attempt tries the next address
 					// without delay).
-					start_next(&mut active, &mut remaining, &make_future);
+					push_next_addr(&mut active, &mut remaining, &make_future);
 					next_attempt_at = Instant::now() + cfg.connection_attempt_delay;
 				}
 				Err(_) => {
 					// Timer fired — start the next candidate.
-					start_next(&mut active, &mut remaining, &make_future);
+					push_next_addr(&mut active, &mut remaining, &make_future);
 					next_attempt_at = Instant::now() + cfg.connection_attempt_delay;
 				}
 			}
@@ -123,7 +123,7 @@ where
 	}
 }
 
-fn start_next<'a, T, E, F>(
+fn push_next_addr<'a, T, E, F>(
 	active: &mut FuturesUnordered<BoxFuture<'a, (Result<T, E>, SocketAddr)>>,
 	remaining: &mut VecDeque<SocketAddr>, make_future: &F,
 ) where
