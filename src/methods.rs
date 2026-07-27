@@ -5,4 +5,3 @@ pub const POST: &'static str = "POST";
 pub const OPTIONS: &'static str = "OPTIONS";
 pub const HEAD: &'static str = "HEAD";
 pub const CONNECT: &'static str = "CONNECT";
-
