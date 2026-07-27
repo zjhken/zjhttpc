@@ -326,8 +326,8 @@ impl ZJHttpClient {
 		let addr = resolve_1st_ip(req).await?;
 		let (mut stream, reused) = pick_or_connect_stream(self, &req, &addr).await?;
 
-		let (mut stream, reused) =
-			pick_or_connect_stream_with_happy_eyeballs_ip(self, &req, &addr).await?;
+		// let (mut stream, reused) =
+		// 	pick_or_connect_stream_with_happy_eyeballs_ip(self, &req, &addr).await?;
 
 		// If send_header fails on a reused (pooled) connection, it's likely stale.
 		// Retry once with a fresh connection — body hasn't been consumed yet, so retry is safe.
