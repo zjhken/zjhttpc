@@ -39,7 +39,7 @@ use crate::{
 };
 use snafu::OptionExt;
 
-use tracing::{error, trace};
+use tracing::{error, info, trace};
 
 /// Connection type for pool key
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -230,22 +230,34 @@ pub struct ZJHttpClient {
     #[builder(default = "Arc::new(ConnectionPoolInner::new(30, 1000, Duration::from_secs(90)))")]
     pub(crate) connection_pool: ConnectionPool,
     #[builder(default)]
-    pub(crate) tls_config: std::sync::OnceLock<std::result::Result<Arc<rustls::ClientConfig>, ZjhttpcError>>,
+    pub(crate) tls_config:
+        std::sync::OnceLock<std::result::Result<Arc<rustls::ClientConfig>, ZjhttpcError>>,
 }
 
 impl std::fmt::Debug for ZJHttpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ZJHttpClient")
-            .field("global_send_header_timeout", &self.global_send_header_timeout)
-            .field("global_read_header_timeout", &self.global_read_header_timeout)
+            .field(
+                "global_send_header_timeout",
+                &self.global_send_header_timeout,
+            )
+            .field(
+                "global_read_header_timeout",
+                &self.global_read_header_timeout,
+            )
             .field("global_read_body_timeout", &self.global_read_body_timeout)
             .field("global_connect_timeout", &self.global_connect_timeout)
             .field("global_trust_store_pem", &self.global_trust_store_pem)
             .field("global_proxy", &self.global_proxy)
             .field("global_max_header_bytes", &self.global_max_header_bytes)
-            .field("connection_pool", &format!("<pool with {} entries, {} connections>",
-                self.connection_pool.map.len(),
-                self.connection_pool.total_count.load(Ordering::Relaxed)))
+            .field(
+                "connection_pool",
+                &format!(
+                    "<pool with {} entries, {} connections>",
+                    self.connection_pool.map.len(),
+                    self.connection_pool.total_count.load(Ordering::Relaxed)
+                ),
+            )
             .field("tls_config", &"OnceLock<Arc<ClientConfig>>")
             .finish()
     }
@@ -262,15 +274,19 @@ impl ZJHttpClient {
             global_trust_store_pem: None,
             global_proxy: None,
             global_max_header_bytes: Some(64 * 1024),
-            connection_pool: Some(Arc::new(ConnectionPoolInner::new(30, 1000, Duration::from_secs(90)))),
+            connection_pool: Some(Arc::new(ConnectionPoolInner::new(
+                30,
+                1000,
+                Duration::from_secs(90),
+            ))),
             tls_config: Some(std::sync::OnceLock::new()),
         }
     }
 
     pub(crate) fn tls_config(&self) -> Result<Arc<rustls::ClientConfig>> {
-        let result = self.tls_config.get_or_init(|| {
-            create_tls_config(&self.global_trust_store_pem).map(Arc::new)
-        });
+        let result = self
+            .tls_config
+            .get_or_init(|| create_tls_config(&self.global_trust_store_pem).map(Arc::new));
         match result {
             Ok(config) => Ok(config.clone()),
             Err(e) => Err(e.clone()),
@@ -293,8 +309,17 @@ impl ZJHttpClient {
         self
     }
 
-    pub fn set_pool_config(mut self, max_per_key: usize, max_total: usize, idle_timeout: Duration) -> Self {
-        self.connection_pool = Arc::new(ConnectionPoolInner::new(max_per_key, max_total, idle_timeout));
+    pub fn set_pool_config(
+        mut self,
+        max_per_key: usize,
+        max_total: usize,
+        idle_timeout: Duration,
+    ) -> Self {
+        self.connection_pool = Arc::new(ConnectionPoolInner::new(
+            max_per_key,
+            max_total,
+            idle_timeout,
+        ));
         self
     }
 
@@ -326,8 +351,7 @@ impl ZJHttpClient {
                 trace!(
                     "pooled connection failed during read_headers_to_resp, retrying with fresh connection: {e:#}"
                 );
-                let mut stream =
-                    connect_fresh_stream(self, &req, &addr).await?;
+                let mut stream = connect_fresh_stream(self, &req, &addr).await?;
                 send_header(self, req, &mut stream).await?;
                 send_body(req, &mut stream).await?;
                 read_headers_to_resp(self, req, stream, addr).await
@@ -406,10 +430,7 @@ async fn pick_or_connect_stream(
         };
 
         let target_host = req.url.host_str().context(NoHostSnafu)?;
-        let target_port = req
-            .url
-            .port_or_known_default()
-            .context(NoPortSnafu)?;
+        let target_port = req.url.port_or_known_default().context(NoPortSnafu)?;
 
         let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
         let stream = proxy_connector
@@ -434,10 +455,10 @@ async fn pick_or_connect_stream(
             };
 
             if let Some(stream_from_pool) = try_pick_from_pool(&client.connection_pool, &key) {
-                trace!(?addr, "picking up direct TCP stream from pool");
+                info!(?addr, "picking up direct TCP stream from pool");
                 return Ok((stream_from_pool, true));
             }
-            trace!(?addr, "no existing TCP connection for this addr");
+            info!(?addr, "no existing TCP connection for this addr");
             let stream = connect_fresh_tcp(client, req, addr).await?;
             Ok((stream, false))
         }
@@ -455,7 +476,10 @@ async fn pick_or_connect_stream(
             let stream = connect_fresh_tls(client, req, addr).await?;
             Ok((stream, false))
         }
-        others => Err(UnsupportedSchemeSnafu { scheme: others.to_string() }.build()),
+        others => Err(UnsupportedSchemeSnafu {
+            scheme: others.to_string(),
+        }
+        .build()),
     }
 }
 
@@ -469,7 +493,10 @@ async fn connect_fresh_stream(
     match req.url.scheme() {
         "http" => connect_fresh_tcp(client, req, addr).await,
         "https" => connect_fresh_tls(client, req, addr).await,
-        others => Err(UnsupportedSchemeSnafu { scheme: others.to_string() }.build()),
+        others => Err(UnsupportedSchemeSnafu {
+            scheme: others.to_string(),
+        }
+        .build()),
     }
 }
 
@@ -481,8 +508,14 @@ async fn connect_fresh_tcp(
     let connect_timeout = req.connect_timeout.unwrap_or(client.global_connect_timeout);
     match timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => Ok(Box::new(stream)),
-        Ok(Err(e)) => Err(ConnectionSnafu { message: format!("TCP connection failed: {e}") }.build()),
-        Err(_) => Err(ConnectionTimeoutSnafu { duration: connect_timeout }.build()),
+        Ok(Err(e)) => Err(ConnectionSnafu {
+            message: format!("TCP connection failed: {e}"),
+        }
+        .build()),
+        Err(_) => Err(ConnectionTimeoutSnafu {
+            duration: connect_timeout,
+        }
+        .build()),
     }
 }
 
@@ -508,13 +541,25 @@ async fn connect_fresh_tls(
     };
     let tcp_stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => return Err(ConnectionSnafu { message: format!("TCP connection failed: {e}") }.build()),
+        Ok(Err(e)) => {
+            return Err(ConnectionSnafu {
+                message: format!("TCP connection failed: {e}"),
+            }
+            .build());
+        }
         Err(_) => {
-            return Err(ConnectionTimeoutSnafu { duration: connect_timeout }.build());
+            return Err(ConnectionTimeoutSnafu {
+                duration: connect_timeout,
+            }
+            .build());
         }
     };
-    let tls_stream = tls_connector.connect(host, tcp_stream).await
-        .map_err(|e| TlsSnafu { message: format!("TLS handshake failed: {e}") }.build())?;
+    let tls_stream = tls_connector.connect(host, tcp_stream).await.map_err(|e| {
+        TlsSnafu {
+            message: format!("TLS handshake failed: {e}"),
+        }
+        .build()
+    })?;
     Ok(Box::new(tls_stream))
 }
 
@@ -539,10 +584,12 @@ async fn wrap_target_tls(
             }.build());
         }
     };
-    let tls_stream = tls_connector
-        .connect(host, stream)
-        .await
-        .map_err(|e| TlsSnafu { message: format!("TLS handshake to target via proxy failed: {e}") }.build())?;
+    let tls_stream = tls_connector.connect(host, stream).await.map_err(|e| {
+        TlsSnafu {
+            message: format!("TLS handshake to target via proxy failed: {e}"),
+        }
+        .build()
+    })?;
     Ok(Box::new(tls_stream))
 }
 
@@ -551,15 +598,27 @@ fn try_pick_from_pool(pool: &ConnectionPool, key: &ConnectionKey) -> Option<Boxe
 }
 
 async fn resolve_1st_ip(req: &mut Request) -> Result<SocketAddr> {
-    let addrs = req.url.socket_addrs(|| None)
-        .map_err(|e| DnsSnafu { message: format!("failed to resolve hostname: {e}") }.build())?;
+    let addrs = req.url.socket_addrs(|| None).map_err(|e| {
+        DnsSnafu {
+            message: format!("failed to resolve hostname: {e}"),
+        }
+        .build()
+    })?;
     if addrs.is_empty() {
-        return Err(DnsSnafu { message: "no result in DNS resolve".to_string() }.build());
+        return Err(DnsSnafu {
+            message: "no result in DNS resolve".to_string(),
+        }
+        .build());
     }
     let mut rng = rand::rng();
     let addr = addrs
         .choose(&mut rng)
-        .ok_or_else(|| DnsSnafu { message: "no result in DNS resolve".to_string() }.build())?
+        .ok_or_else(|| {
+            DnsSnafu {
+                message: "no result in DNS resolve".to_string(),
+            }
+            .build()
+        })?
         .to_owned();
     Ok(addr)
 }
@@ -570,7 +629,10 @@ pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::
         None => {
             let result = load_native_certs();
             if !result.errors.is_empty() && result.certs.is_empty() {
-                return Err(CertificateSnafu { message: format!("failed to load system certs: {:?}", result.errors) }.build());
+                return Err(CertificateSnafu {
+                    message: format!("failed to load system certs: {:?}", result.errors),
+                }
+                .build());
             }
             result.certs
         }
@@ -587,8 +649,12 @@ pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::
                 .collect::<Vec<_>>()
         }
         Some(TrustStorePem::Path(p)) => {
-            let file = std::fs::File::open(p)
-                .map_err(|e| CertificateSnafu { message: format!("failed to open trust store file: {e}") }.build())?;
+            let file = std::fs::File::open(p).map_err(|e| {
+                CertificateSnafu {
+                    message: format!("failed to open trust store file: {e}"),
+                }
+                .build()
+            })?;
             let mut reader = std::io::BufReader::new(file);
             rustls_pemfile::certs(&mut reader)
                 .filter_map(|re| match re {
@@ -602,8 +668,14 @@ pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::
         }
     };
     for cert in certs {
-        root_store.add(&rustls::Certificate(cert.to_vec()))
-            .map_err(|e| CertificateSnafu { message: format!("failed to add certificate: {e}") }.build())?;
+        root_store
+            .add(&rustls::Certificate(cert.to_vec()))
+            .map_err(|e| {
+                CertificateSnafu {
+                    message: format!("failed to add certificate: {e}"),
+                }
+                .build()
+            })?;
     }
     let client_config = rustls::ClientConfig::builder()
         .with_safe_defaults()
@@ -671,9 +743,7 @@ where
             stream.write_all(b"Expect: 100-continue\r\n").await?;
         }
 
-        stream
-            .write_all(b"Connection: keep-alive\r\n")
-            .await?;
+        stream.write_all(b"Connection: keep-alive\r\n").await?;
         stream.write_all(b"\r\n").await?;
         stream.flush().await?;
 
@@ -683,14 +753,20 @@ where
             if n == 0 {
                 return Err(ConnectionSnafu {
                     message: "stream closed before read the 100 continue response".to_string(),
-                }.build());
+                }
+                .build());
             }
-            let resp = std::str::from_utf8(&buf[0..n])
-                .map_err(|e| InvalidResponseSnafu { message: format!("resp after expect 100 is not utf8: {e}") }.build())?;
+            let resp = std::str::from_utf8(&buf[0..n]).map_err(|e| {
+                InvalidResponseSnafu {
+                    message: format!("resp after expect 100 is not utf8: {e}"),
+                }
+                .build()
+            })?;
             if !resp.starts_with("HTTP/1.") || !resp.contains(" 100 ") {
                 return Err(InvalidResponseSnafu {
                     message: format!("received non-100-continue resp={resp}"),
-                }.build());
+                }
+                .build());
             }
         }
         Ok(())
@@ -698,15 +774,20 @@ where
 
     match future::timeout(timeout_dur, send_future).await {
         Ok(result) => result,
-        Err(_) => Err(SendHeaderTimeoutSnafu { duration: timeout_dur }.build()),
+        Err(_) => Err(SendHeaderTimeoutSnafu {
+            duration: timeout_dur,
+        }
+        .build()),
     }
 }
 
 async fn prepare_multipart_content_length(req: &mut Request) -> Result<()> {
-    if matches!(req.body, Body::MultipartForm(_)) && !req.use_chunked
-        && let Body::MultipartForm(form) = &req.body {
-            req.content_length = form.compute_content_length().await?;
-        }
+    if matches!(req.body, Body::MultipartForm(_))
+        && !req.use_chunked
+        && let Body::MultipartForm(form) = &req.body
+    {
+        req.content_length = form.compute_content_length().await?;
+    }
     Ok(())
 }
 
@@ -717,7 +798,9 @@ where
     if data.is_empty() {
         return Ok(());
     }
-    stream.write_all(format!("{:x}\r\n", data.len()).as_bytes()).await?;
+    stream
+        .write_all(format!("{:x}\r\n", data.len()).as_bytes())
+        .await?;
     stream.write_all(data).await?;
     stream.write_all(b"\r\n").await?;
     Ok(())
@@ -798,13 +881,15 @@ where
 
                 match field {
                     crate::body::MultipartField::Text(name, value) => {
-                        writer.write_data(
-                            format!(
-                                "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
-                                name
+                        writer
+                            .write_data(
+                                format!(
+                                    "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                                    name
+                                )
+                                .as_bytes(),
                             )
-                            .as_bytes(),
-                        ).await?;
+                            .await?;
                         writer.write_data(value.as_bytes()).await?;
                         writer.write_data(b"\r\n").await?;
                     }
@@ -834,7 +919,9 @@ where
                         ).as_bytes())
                         .await?;
                         writer
-                            .write_data(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
+                            .write_data(
+                                format!("Content-Type: {}\r\n\r\n", content_type).as_bytes(),
+                            )
                             .await?;
 
                         // Read and write file content
@@ -870,7 +957,9 @@ where
                         ).as_bytes())
                         .await?;
                         writer
-                            .write_data(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
+                            .write_data(
+                                format!("Content-Type: {}\r\n\r\n", content_type).as_bytes(),
+                            )
                             .await?;
 
                         // Read and write file content
@@ -906,7 +995,9 @@ where
                         ).as_bytes())
                         .await?;
                         writer
-                            .write_data(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes())
+                            .write_data(
+                                format!("Content-Type: {}\r\n\r\n", content_type).as_bytes(),
+                            )
                             .await?;
 
                         // Read and write stream content
@@ -964,23 +1055,33 @@ async fn read_headers_to_resp(
         }
     };
 
-    let input = std::str::from_utf8(&all_headers)
-        .map_err(|e| InvalidResponseSnafu { message: format!("response headers are not valid UTF-8: {e}") }.build())?;
+    let input = std::str::from_utf8(&all_headers).map_err(|e| {
+        InvalidResponseSnafu {
+            message: format!("response headers are not valid UTF-8: {e}"),
+        }
+        .build()
+    })?;
 
     // Parse the first line (status line)
-    let (remaining, (_, http_version, _, status_code, _)) = parse_resp_first_line(input)
-        .map_err(|e| {
+    let (remaining, (_, http_version, _, status_code, _)) =
+        parse_resp_first_line(input).map_err(|e| {
             InvalidResponseSnafu {
                 message: format!(
                     "parse resp first line failed: {}. data={input}",
                     e.to_owned(),
                 ),
-            }.build()
+            }
+            .build()
         })?;
 
     // Parse the remaining headers
     let headers = parse_headers(remaining)
-        .map_err(|e| InvalidResponseSnafu { message: e.to_string() }.build())?
+        .map_err(|e| {
+            InvalidResponseSnafu {
+                message: e.to_string(),
+            }
+            .build()
+        })?
         .into_iter()
         .map(|(key, value)| (key.to_ascii_lowercase(), value.to_owned()))
         .collect::<Vec<_>>();
@@ -1000,23 +1101,28 @@ async fn read_headers_to_resp(
         &overflow[..overflow_len],
         Some(client.connection_pool.clone()),
     )
-    .map_err(|e| InvalidResponseSnafu { message: e.to_string() }.build())
+    .map_err(|e| {
+        InvalidResponseSnafu {
+            message: e.to_string(),
+        }
+        .build()
+    })
 }
 
 fn parse_headers(input: &str) -> std::result::Result<Vec<(&str, &str)>, ZjhttpcError> {
     let mut vec = vec![];
     let mut rest: &str = input;
     loop {
-        let (out, (key, _, value, _)) = parse_one_line_header(rest)
-            .map_err(|e| {
-                InvalidResponseSnafu {
-                    message: format!(
-                        "failed to parse one line header: {}. line={}",
-                        e.to_owned(),
-                        input.to_string()
-                    ),
-                }.build()
-            })?;
+        let (out, (key, _, value, _)) = parse_one_line_header(rest).map_err(|e| {
+            InvalidResponseSnafu {
+                message: format!(
+                    "failed to parse one line header: {}. line={}",
+                    e.to_owned(),
+                    input.to_string()
+                ),
+            }
+            .build()
+        })?;
         rest = out;
         vec.push((key, value));
         if rest == "\r\n" {
@@ -1074,7 +1180,8 @@ where
                     "unexpected EOF while reading until delimiter (read {} bytes)",
                     buf.len()
                 ),
-            }.build());
+            }
+            .build());
         }
 
         buf.extend_from_slice(&tmp[..n]);
@@ -1083,7 +1190,8 @@ where
             return Err(ResponseTooLargeSnafu {
                 actual: buf.len(),
                 max: max_bytes,
-            }.build());
+            }
+            .build());
         }
 
         // Search the tail that could contain a straddling delimiter
@@ -1101,7 +1209,6 @@ where
         }
     }
 }
-
 
 pub enum HttpVersion {
     V1_1,
@@ -1576,7 +1683,10 @@ mod tests {
     }
     impl MockStream {
         fn new(data: &[u8]) -> Self {
-            Self { data: data.to_vec(), pos: 0 }
+            Self {
+                data: data.to_vec(),
+                pos: 0,
+            }
         }
     }
     impl async_std::io::Read for MockStream {
@@ -1586,18 +1696,34 @@ mod tests {
             buf: &mut [u8],
         ) -> std::task::Poll<std::io::Result<usize>> {
             let n = std::cmp::min(buf.len(), self.data.len() - self.pos);
-            if n == 0 { return std::task::Poll::Ready(Ok(0)); }
+            if n == 0 {
+                return std::task::Poll::Ready(Ok(0));
+            }
             buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
             self.pos += n;
             std::task::Poll::Ready(Ok(n))
         }
     }
     impl async_std::io::Write for MockStream {
-        fn poll_write(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>, _buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
             std::task::Poll::Ready(Ok(0))
         }
-        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
-        fn poll_close(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
     }
     impl crate::stream::RWStream for MockStream {}
 
@@ -1722,18 +1848,20 @@ mod tests {
 
     #[test]
     fn test_set_pool_config() {
-        let client = ZJHttpClient::builder()
-            .build()
-            .unwrap();
+        let client = ZJHttpClient::builder().build().unwrap();
         let client = client.set_pool_config(10, 200, Duration::from_secs(30));
         // Verify pool works with new config
         let info = make_stream_info();
         for _ in 0..10 {
-            client.connection_pool.return_stream(make_stream(), info.clone());
+            client
+                .connection_pool
+                .return_stream(make_stream(), info.clone());
         }
         // 11th should be dropped (per-key limit = 10)
         client.connection_pool.return_stream(make_stream(), info);
-        assert_eq!(client.connection_pool.total_count.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            client.connection_pool.total_count.load(Ordering::Relaxed),
+            10
+        );
     }
-
 }
