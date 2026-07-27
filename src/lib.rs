@@ -4,6 +4,7 @@ pub mod content_type;
 pub mod cookie;
 pub mod error;
 pub use error::{Result, ZjhttpcError};
+pub mod happy_eyeballs;
 pub mod header;
 pub mod methods;
 pub mod misc;

@@ -3,7 +3,6 @@ use async_std::{
 	io::{ReadExt, WriteExt},
 	net::TcpStream,
 };
-use rand::seq::IndexedRandom;
 
 use async_tls::TlsConnector;
 use dashmap::DashMap;
@@ -323,11 +322,9 @@ impl ZJHttpClient {
 	pub async fn send(&self, req: &mut Request) -> Result<Response> {
 		prepare_multipart_content_length(req).await?;
 
-		let addr = resolve_1st_ip(req).await?;
-		let (mut stream, reused) = pick_or_connect_stream(self, &req, &addr).await?;
-
-		// let (mut stream, reused) =
-		// 	pick_or_connect_stream_with_happy_eyeballs_ip(self, &req, &addr).await?;
+		let addrs = resolve_ips(req).await?;
+		let (mut stream, reused, addr) =
+			pick_or_connect_stream_with_happy_eyeballs_ip(self, &req, &addrs).await?;
 
 		// If send_header fails on a reused (pooled) connection, it's likely stale.
 		// Retry once with a fresh connection — body hasn't been consumed yet, so retry is safe.
@@ -361,8 +358,9 @@ impl ZJHttpClient {
 	}
 
 	pub async fn send_header_only(&self, req: &mut Request) -> Result<(BoxedStream, SocketAddr)> {
-		let addr = resolve_1st_ip(req).await?;
-		let (mut stream, reused) = pick_or_connect_stream(self, &req, &addr).await?;
+		let addrs = resolve_ips(req).await?;
+		let (mut stream, reused, addr) =
+			pick_or_connect_stream_with_happy_eyeballs_ip(self, &req, &addrs).await?;
 
 		if let Err(e) = send_header(self, req, &mut stream).await {
 			if reused {
@@ -390,10 +388,48 @@ impl ZJHttpClient {
 	}
 }
 
+/// Pick a pooled stream across all candidate addresses, or race fresh
+/// connections using Happy Eyeballs (RFC 8305). Returns the winning stream
+/// together with the address it is bound to — downstream code uses that
+/// address as the pool key when the stream is returned.
+///
+/// Proxy connections always go through the proxy's single address, so racing
+/// has no benefit there — we fall back to the existing single-addr path with
+/// the first resolved candidate (used purely as a pool key).
 async fn pick_or_connect_stream_with_happy_eyeballs_ip(
-	client: &ZJHttpClient, req: &Request, addr: &SocketAddr,
-) -> Result<(BoxedStream, bool)> {
-	unimplemented!()
+	client: &ZJHttpClient, req: &Request, addrs: &[SocketAddr],
+) -> Result<(BoxedStream, bool, SocketAddr)> {
+	let has_proxy = req
+		.proxy
+		.as_ref()
+		.or(client.global_proxy.as_ref())
+		.is_some();
+	if has_proxy {
+		let addr = addrs[0];
+		let (stream, reused) = pick_or_connect_stream(client, req, &addr).await?;
+		return Ok((stream, reused, addr));
+	}
+
+	// Phase 1: pool lookup across all candidates (pure HashMap, no I/O).
+	for addr in addrs {
+		if let Some(stream) = try_pool_pick_direct(client, req, addr) {
+			trace!(
+				?addr,
+				"picking up stream from pool during happy-eyeballs scan"
+			);
+			return Ok((stream, true, *addr));
+		}
+	}
+
+	// Phase 2: race fresh direct connects.
+	let happy_eyeballs_config = crate::happy_eyeballs::HappyEyeballsConfig::default();
+	let (stream, addr) = crate::happy_eyeballs::select_happy_eyeballs(
+		addrs.to_vec(),
+		happy_eyeballs_config,
+		|addr| Box::pin(async move { connect_fresh_stream(client, req, &addr).await }),
+	)
+	.await?;
+	Ok((stream, false, addr))
 }
 
 /// Try to pick a stream from the connection pool, or create a new one.
@@ -590,7 +626,7 @@ fn try_pick_from_pool(pool: &ConnectionPool, key: &ConnectionKey) -> Option<Boxe
 	pool.pick(key)
 }
 
-async fn resolve_1st_ip(req: &mut Request) -> Result<SocketAddr> {
+async fn resolve_ips(req: &mut Request) -> Result<Vec<SocketAddr>> {
 	let addrs = req.url.socket_addrs(|| None).map_err(|e| {
 		DnsSnafu {
 			message: format!("failed to resolve hostname: {e}"),
@@ -603,17 +639,24 @@ async fn resolve_1st_ip(req: &mut Request) -> Result<SocketAddr> {
 		}
 		.build());
 	}
-	let mut rng = rand::rng();
-	let addr = addrs
-		.choose(&mut rng)
-		.ok_or_else(|| {
-			DnsSnafu {
-				message: "no result in DNS resolve".to_string(),
-			}
-			.build()
-		})?
-		.to_owned();
-	Ok(addr)
+	Ok(addrs)
+}
+
+/// Look up a pooled stream for a direct (non-proxy) connection. Returns None
+/// when the scheme is unsupported or no pooled entry exists.
+fn try_pool_pick_direct(
+	client: &ZJHttpClient, req: &Request, addr: &SocketAddr,
+) -> Option<BoxedStream> {
+	let connection_type = match req.url.scheme() {
+		"http" => ConnectionType::DirectTcp,
+		"https" => ConnectionType::DirectTls,
+		_ => return None,
+	};
+	let key = ConnectionKey {
+		addr: *addr,
+		connection_type,
+	};
+	try_pick_from_pool(&client.connection_pool, &key)
 }
 
 pub fn create_tls_config(trust_store: &Option<TrustStorePem>) -> Result<rustls::ClientConfig> {
